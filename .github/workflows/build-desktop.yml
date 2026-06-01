@@ -1,0 +1,45 @@
+name: Build Desktop Apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS
+            artifact_name: IR-Analyzer-macOS
+            build_command: bash scripts/build_macos.sh
+            release_file: release/IR-Analyzer-macOS.zip
+          - os: windows-latest
+            label: Windows
+            artifact_name: IR-Analyzer-Windows
+            build_command: powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+            release_file: release/IR-Analyzer-Windows.zip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build desktop app
+        run: ${{ matrix.build_command }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.release_file }}
+          if-no-files-found: error
