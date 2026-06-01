@@ -1,5 +1,5 @@
 """
-main.py - IR Spectrum Analyzer 진입점
+main.py - In Situ IR Spectrum Analyzer 진입점
 """
 
 import sys
@@ -11,7 +11,7 @@ from ui.theme import DARK_QSS
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("IR Analyzer")
+    app.setApplicationName("In Situ IR Analyzer")
     app.setStyle("Fusion")
     app.setStyleSheet(DARK_QSS)
 

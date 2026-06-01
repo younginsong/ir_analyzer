@@ -1,4 +1,4 @@
-# IR Analyzer — Codex
+# In Situ IR Analyzer — Codex
 
 in situ IR 스펙트럼 분석 웹앱 프로젝트.
 

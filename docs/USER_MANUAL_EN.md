@@ -1,6 +1,6 @@
-# IR Analyzer User Manual
+# In Situ IR Analyzer User Manual
 
-This manual walks new users through the full IR Analyzer workflow: loading
+This manual walks new users through the full In Situ IR Analyzer workflow: loading
 spectra, fitting peaks, assigning potentials, reviewing analysis plots, and
 exporting results.
 
@@ -29,7 +29,7 @@ python ir_analyzer\main.py
 ```
 
 If you are using a packaged desktop release, unzip the package and open the
-`IR Analyzer` app or executable.
+`In Situ IR Analyzer` app or executable.
 
 ## 2. Preparing Input Data
 

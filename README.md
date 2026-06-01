@@ -1,6 +1,6 @@
-# IR Analyzer
+# In Situ IR Analyzer
 
-IR Analyzer is a desktop application for in situ IR spectrum inspection,
+In Situ IR Analyzer is a desktop application for in situ IR spectrum inspection,
 baseline correction, peak deconvolution, Stark tuning analysis, and Excel
 export. It is optimized for OH stretching analysis and also includes CO and
 Si-O workflows used in electrochemical IR experiments.

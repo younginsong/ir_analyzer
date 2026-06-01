@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 RELEASE_DIR="$ROOT_DIR/release"
-APP_NAME="IR Analyzer"
+APP_NAME="In Situ IR Analyzer"
 STAGE_DIR="${STAGE_DIR:-$(mktemp -d /tmp/ir-analyzer-build.XXXXXX)}"
 VENV_DIR="$STAGE_DIR/.venv-build"
 
@@ -71,9 +71,9 @@ echo "[5/5] Sanitizing bundle and packaging release zip"
 cp -R "$STAGE_DIR/dist/$APP_NAME.app" "$DIST_DIR/"
 xattr -crs "$DIST_DIR/$APP_NAME.app" || true
 codesign --force --deep --sign - "$DIST_DIR/$APP_NAME.app"
-ditto -c -k --keepParent --norsrc "$DIST_DIR/$APP_NAME.app" "$RELEASE_DIR/IR-Analyzer-macOS.zip"
+ditto -c -k --keepParent --norsrc "$DIST_DIR/$APP_NAME.app" "$RELEASE_DIR/In-Situ-IR-Analyzer-macOS.zip"
 
 echo
 echo "Build complete:"
 echo "  App bundle: $DIST_DIR/$APP_NAME.app"
-echo "  Zip file:   $RELEASE_DIR/IR-Analyzer-macOS.zip"
+echo "  Zip file:   $RELEASE_DIR/In-Situ-IR-Analyzer-macOS.zip"

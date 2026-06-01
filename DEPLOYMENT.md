@@ -10,8 +10,8 @@ bash scripts/build_macos.sh
 
 Output:
 
-- `dist/IR Analyzer.app`
-- `release/IR-Analyzer-macOS.zip`
+- `dist/In Situ IR Analyzer.app`
+- `release/In-Situ-IR-Analyzer-macOS.zip`
 
 ### Windows
 
@@ -23,8 +23,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 
 Output:
 
-- `dist/IR Analyzer/`
-- `release/IR-Analyzer-Windows.zip`
+- `dist/In Situ IR Analyzer/`
+- `release/In-Situ-IR-Analyzer-Windows.zip`
 
 ## 2. GitHub Actions로 macOS / Windows 동시 빌드
 
@@ -44,14 +44,14 @@ Output:
 
 다운로드 버튼은 보통 아래처럼 운영합니다.
 
-- `IR-Analyzer-macOS.zip`
-- `IR-Analyzer-Windows.zip`
+- `In-Situ-IR-Analyzer-macOS.zip`
+- `In-Situ-IR-Analyzer-Windows.zip`
 
 예시 링크:
 
 ```html
-<a href="/downloads/IR-Analyzer-macOS.zip">Download for macOS</a>
-<a href="/downloads/IR-Analyzer-Windows.zip">Download for Windows</a>
+<a href="/downloads/In-Situ-IR-Analyzer-macOS.zip">Download for macOS</a>
+<a href="/downloads/In-Situ-IR-Analyzer-Windows.zip">Download for Windows</a>
 ```
 
 ## 4. 사용자 안내 문구

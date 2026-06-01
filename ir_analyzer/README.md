@@ -1,4 +1,4 @@
-# IR Spectrum Analyzer
+# In Situ IR Spectrum Analyzer
 
 FTIR 스펙트럼 디컨볼루션 도구 — OH stretching 4-peak 분석에 최적화
 

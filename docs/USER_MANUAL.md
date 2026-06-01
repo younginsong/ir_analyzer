@@ -1,6 +1,6 @@
-# IR Analyzer User Manual
+# In Situ IR Analyzer User Manual
 
-이 문서는 IR Analyzer를 처음 사용하는 사람이 스펙트럼을 불러오고,
+이 문서는 In Situ IR Analyzer를 처음 사용하는 사람이 스펙트럼을 불러오고,
 피팅하고, 전위별 분석 결과를 내보내는 전체 흐름을 따라갈 수 있도록
 작성한 사용자 매뉴얼입니다.
 
@@ -26,7 +26,7 @@ python -m pip install -r ir_analyzer\requirements.txt
 python ir_analyzer\main.py
 ```
 
-배포된 데스크톱 패키지를 사용하는 경우에는 압축을 풀고 `IR Analyzer`
+배포된 데스크톱 패키지를 사용하는 경우에는 압축을 풀고 `In Situ IR Analyzer`
 앱 또는 실행 파일을 열면 됩니다.
 
 ## 2. 입력 데이터 준비

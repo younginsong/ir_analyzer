@@ -16,14 +16,14 @@ jobs:
         include:
           - os: macos-latest
             label: macOS
-            artifact_name: IR-Analyzer-macOS
+            artifact_name: In-Situ-IR-Analyzer-macOS
             build_command: bash scripts/build_macos.sh
-            release_file: release/IR-Analyzer-macOS.zip
+            release_file: release/In-Situ-IR-Analyzer-macOS.zip
           - os: windows-latest
             label: Windows
-            artifact_name: IR-Analyzer-Windows
+            artifact_name: In-Situ-IR-Analyzer-Windows
             build_command: powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
-            release_file: release/IR-Analyzer-Windows.zip
+            release_file: release/In-Situ-IR-Analyzer-Windows.zip
 
     steps:
       - name: Check out source

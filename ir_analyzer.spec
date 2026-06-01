@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH)
 APP_DIR = ROOT / "ir_analyzer"
-APP_NAME = "IR Analyzer"
+APP_NAME = "In Situ IR Analyzer"
 
 hiddenimports = []
 hiddenimports += ["numpy.core", "numpy.core.multiarray"]

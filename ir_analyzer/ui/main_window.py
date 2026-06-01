@@ -44,7 +44,7 @@ from dataclasses import dataclass as _dc, field as _field
 _trapezoid = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
 MAX_OH_SNAPSHOTS = 5
 SETTINGS_ORG = "KIST"
-SETTINGS_APP = "IR Analyzer"
+SETTINGS_APP = "In Situ IR Analyzer"
 SESSION_DIR_KEY = "paths/session_dir"
 
 
@@ -128,7 +128,7 @@ class _DetachedAnalysisWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._allow_close = False
-        self.setWindowTitle("IR Analyzer - Analysis")
+        self.setWindowTitle("In Situ IR Analyzer - Analysis")
         self.resize(980, 760)
 
     def allow_close(self):
@@ -145,7 +145,7 @@ class _DetachedAnalysisWindow(QMainWindow):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IR Analyzer")
+        self.setWindowTitle("In Situ IR Analyzer")
         self.setMinimumSize(1280, 780)
 
         # 현재 활성 스펙트럼 상태
@@ -623,7 +623,7 @@ class MainWindow(QMainWindow):
     def _import_sessions(self):
         fps, _ = QFileDialog.getOpenFileNames(
             self, "Import Sessions", "",
-            "IR Analyzer Session (*.irsession)"
+            "In Situ IR Analyzer Session (*.irsession)"
         )
         if fps:
             self._import_sessions_from_paths(fps)
@@ -1162,7 +1162,7 @@ class MainWindow(QMainWindow):
         self.right_panel.clear_current_summary()
         self.right_panel.set_snapshot_names([], selected_index=-1)
         self.right_panel.btn_snapshot_save.setEnabled(False)
-        self.setWindowTitle("IR Analyzer")
+        self.setWindowTitle("In Situ IR Analyzer")
         self.status_label.setText(
             "Ready  —  drag CSV files onto the sidebar to load"
         )
@@ -1399,7 +1399,7 @@ class MainWindow(QMainWindow):
         self._ab_crop         = None
         self._baseline_points = []
         self.right_panel.set_wavenumber_range(entry.wavenumber[0], entry.wavenumber[-1])
-        self.setWindowTitle(f"IR Analyzer  —  {entry.name}")
+        self.setWindowTitle(f"In Situ IR Analyzer  —  {entry.name}")
         mode = self.right_panel.get_mode()
 
         if mode == 'Total':
@@ -3188,7 +3188,7 @@ class MainWindow(QMainWindow):
             self.analysis_widget.update_plots([], {}, [])
             self.analysis_widget.update_co_plots([], {}, [])
             self.analysis_widget.update_co_stark_results([])
-            self.setWindowTitle("IR Analyzer")
+            self.setWindowTitle("In Situ IR Analyzer")
             self._sync_analysis_sidebar()
         finally:
             self._loading_session = False
@@ -3303,7 +3303,7 @@ class MainWindow(QMainWindow):
             return
         fp, _ = QFileDialog.getSaveFileName(
             self, title, self._initial_session_dialog_path(suggested_name),
-            "IR Analyzer Session (*.irsession)")
+            "In Situ IR Analyzer Session (*.irsession)")
         if not fp:
             return
         if not fp.endswith('.irsession'):
@@ -3338,7 +3338,7 @@ class MainWindow(QMainWindow):
     def _load_session(self):
         fp, _ = QFileDialog.getOpenFileName(
             self, "Load Session", self._initial_session_dialog_path(),
-            "IR Analyzer Session (*.irsession)")
+            "In Situ IR Analyzer Session (*.irsession)")
         if not fp:
             return
         self._remember_session_dialog_path(fp)

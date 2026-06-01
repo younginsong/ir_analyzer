@@ -1,4 +1,4 @@
-# IR Analyzer — Claude Code
+# In Situ IR Analyzer — Claude Code
 
 in situ IR 스펙트럼 분석 웹앱 프로젝트.
 
