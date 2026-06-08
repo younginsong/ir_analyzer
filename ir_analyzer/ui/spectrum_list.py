@@ -98,7 +98,7 @@ class _InnerListWidget(QListWidget):
             for url in event.mimeData().urls():
                 fp = url.toLocalFile()
                 lower = fp.lower()
-                if lower.endswith('.irsession'):
+                if lower.endswith(('.irsession', '.session')):
                     session_paths.append(fp)
                 elif lower.endswith(('.csv', '.txt', '.asc', '.dpt')):
                     spectrum_paths.append(fp)
@@ -202,7 +202,7 @@ class SpectrumListWidget(QWidget):
     spectra_added     = pyqtSignal(list)        # list[SpectrumEntry] added in one batch
     spectrum_removed  = pyqtSignal(int, str, str)    # (index, filepath, name)
     spectra_reordered = pyqtSignal()
-    session_dropped   = pyqtSignal(list)             # list[irsession filepath]
+    session_dropped   = pyqtSignal(list)             # list[session filepath]
     potential_assignments_changed = pyqtSignal()
     session_filter_changed = pyqtSignal(str)
     workspace_created = pyqtSignal(str)
@@ -897,7 +897,7 @@ class SpectrumListWidget(QWidget):
         if event.mimeData().hasUrls():
             valid = any(
                 u.toLocalFile().lower().endswith(
-                    ('.csv', '.txt', '.asc', '.dpt', '.irsession'))
+                    ('.csv', '.txt', '.asc', '.dpt', '.irsession', '.session'))
                 for u in event.mimeData().urls()
             )
             if valid:
@@ -921,7 +921,7 @@ class SpectrumListWidget(QWidget):
         spectrum_paths = []
         for url in event.mimeData().urls():
             fp = url.toLocalFile()
-            if fp.lower().endswith('.irsession'):
+            if fp.lower().endswith(('.irsession', '.session')):
                 session_paths.append(fp)
             elif fp.lower().endswith(('.csv', '.txt', '.asc', '.dpt')):
                 spectrum_paths.append(fp)

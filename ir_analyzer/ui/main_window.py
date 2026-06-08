@@ -623,7 +623,7 @@ class MainWindow(QMainWindow):
     def _import_sessions(self):
         fps, _ = QFileDialog.getOpenFileNames(
             self, "Import Sessions", "",
-            "In Situ IR Analyzer Session (*.irsession)"
+            "In Situ IR Analyzer Session (*.irsession *.session)"
         )
         if fps:
             self._import_sessions_from_paths(fps)
@@ -691,17 +691,7 @@ class MainWindow(QMainWindow):
 
         existing_labels = self._session_labels_in_use()
         fallback_label = Path(session_path).stem
-        distinct_source_labels = []
-        for spectrum in spectra_data:
-            source_label = spectrum.get('source_session_label') or fallback_label
-            if source_label not in distinct_source_labels:
-                distinct_source_labels.append(source_label)
-        if len(distinct_source_labels) == 1 and distinct_source_labels[0] != fallback_label:
-            distinct_source_labels = [fallback_label]
-        label_map = {
-            source_label: self._make_unique_session_label(source_label, existing_labels)
-            for source_label in distinct_source_labels
-        }
+        mapped_label = self._make_unique_session_label(fallback_label, existing_labels)
 
         names_in_use = {entry.name for entry in self.spectrum_list.get_all_entries()}
         keys_in_use = {entry.filepath for entry in self.spectrum_list.get_all_entries()}
@@ -710,10 +700,6 @@ class MainWindow(QMainWindow):
         imported_entries = []
 
         for idx, spectrum in enumerate(spectra_data):
-            source_label = spectrum.get('source_session_label') or fallback_label
-            if source_label not in label_map:
-                source_label = fallback_label
-            mapped_label = label_map[source_label]
             original_name = spectrum.get('original_name') or spectrum.get('name') or Path(spectrum.get('filepath', '')).name
             display_name = self._make_unique_display_name(mapped_label, original_name, names_in_use)
             source_filepath = spectrum.get('source_spectrum_path') or spectrum.get('filepath', '')
@@ -796,7 +782,7 @@ class MainWindow(QMainWindow):
                             mapped_session = (
                                 entry.source_session_label
                                 if entry is not None and entry.source_session_label
-                                else label_map.get(old_session_key, old_session_key)
+                                else mapped_label
                             )
                             self._total_shifts.setdefault(mapped_session, {})[new_name] = float(shift)
             else:
@@ -3338,7 +3324,7 @@ class MainWindow(QMainWindow):
     def _load_session(self):
         fp, _ = QFileDialog.getOpenFileName(
             self, "Load Session", self._initial_session_dialog_path(),
-            "In Situ IR Analyzer Session (*.irsession)")
+            "In Situ IR Analyzer Session (*.irsession *.session)")
         if not fp:
             return
         self._remember_session_dialog_path(fp)
