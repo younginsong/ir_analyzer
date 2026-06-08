@@ -177,15 +177,50 @@ class _InnerListWidget(QListWidget):
 
 
 class _SessionFilterButton(QPushButton):
-    """Session tab button with a reliable right-click context signal."""
+    """Session tab button with right-click and drag-reorder support."""
     context_requested = pyqtSignal(object)
+    reorder_requested = pyqtSignal(str, object)
+
+    def __init__(self, session_key: str, label: str, parent=None):
+        super().__init__(label, parent)
+        self.session_key = session_key
+        self._press_pos = None
+        self._dragging = False
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
             self.context_requested.emit(event.globalPos())
             event.accept()
             return
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+            self._dragging = False
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._press_pos is not None
+            and event.buttons() & Qt.LeftButton
+            and (event.pos() - self._press_pos).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            self._dragging = True
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._press_pos = None
+            self._dragging = False
+            self.unsetCursor()
+            self.reorder_requested.emit(self.session_key, event.globalPos())
+            event.accept()
+            return
+        self._press_pos = None
+        self._dragging = False
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event):
         self.context_requested.emit(event.globalPos())
@@ -365,7 +400,7 @@ class SpectrumListWidget(QWidget):
             self._session_filter = session_keys[0] if session_keys else self.LOOSE_FILES_KEY
 
         for session_key in session_keys:
-            btn = _SessionFilterButton(self._session_label_for_key(session_key))
+            btn = _SessionFilterButton(session_key, self._session_label_for_key(session_key))
             btn.setObjectName("btn_flat")
             btn.setCheckable(True)
             btn.setChecked(session_key == self._session_filter)
@@ -374,6 +409,7 @@ class SpectrumListWidget(QWidget):
                 lambda global_pos, key=session_key:
                 self._show_session_context_menu(key, global_pos)
             )
+            btn.reorder_requested.connect(self._move_session_filter)
             self._session_button_group.addButton(btn)
             self._session_filter_layout.addWidget(btn)
             self._session_buttons[session_key] = btn
@@ -398,6 +434,69 @@ class SpectrumListWidget(QWidget):
             self.session_save_requested.emit(session_key)
         elif action == close_action:
             self.session_close_requested.emit(session_key)
+
+    def _session_drop_index_from_global_pos(self, source_key: str, global_pos) -> int:
+        ordered_keys = [
+            key for key in self._session_keys_in_order()
+            if key != source_key
+        ]
+        if not ordered_keys:
+            return 0
+
+        x = global_pos.x()
+        for idx, key in enumerate(ordered_keys):
+            btn = self._session_buttons.get(key)
+            if btn is None:
+                continue
+            center_x = btn.mapToGlobal(btn.rect().center()).x()
+            if x < center_x:
+                return idx
+        return len(ordered_keys)
+
+    def _move_session_filter(self, source_key: str, global_pos):
+        current_order = self._session_keys_in_order()
+        if source_key not in current_order:
+            return
+
+        reordered = [key for key in current_order if key != source_key]
+        target_index = self._session_drop_index_from_global_pos(source_key, global_pos)
+        target_index = min(max(target_index, 0), len(reordered))
+        reordered.insert(target_index, source_key)
+        if reordered == current_order:
+            return
+
+        self._workspace_keys = list(reordered)
+
+        grouped_entries = {key: [] for key in reordered}
+        for entry in self._entries:
+            key = self._session_key_for_entry(entry)
+            grouped_entries.setdefault(key, []).append(entry)
+        self._entries = [
+            entry
+            for key in reordered
+            for entry in grouped_entries.get(key, [])
+        ]
+
+        self.list_widget.blockSignals(True)
+        try:
+            self.list_widget.clear()
+            for entry in self._entries:
+                self._add_list_item(entry)
+            last_path = self._last_selected_paths.get(self._session_filter)
+            if last_path:
+                for row, entry in enumerate(self._entries):
+                    if entry.filepath == last_path:
+                        self.list_widget.setCurrentRow(row)
+                        break
+        finally:
+            self.list_widget.blockSignals(False)
+
+        self._rebuild_session_filter_buttons()
+        self._refresh_potential_table()
+        self._refresh_list_visibility()
+        self._on_selection_changed()
+        self.potential_assignments_changed.emit()
+        self.spectra_reordered.emit()
 
     def begin_bulk_update(self):
         """Defer expensive list/table refreshes while many spectra are added."""
