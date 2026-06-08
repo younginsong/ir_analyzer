@@ -9,6 +9,12 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 ROOT = Path(SPECPATH)
 APP_DIR = ROOT / "ir_analyzer"
 APP_NAME = "In Situ IR Analyzer"
+ICON_DIR = ROOT / "assets" / "icons"
+ICON_FILE = (
+    ICON_DIR / "in-situ-ir-analyzer.icns"
+    if sys.platform == "darwin"
+    else ICON_DIR / "in-situ-ir-analyzer.ico"
+)
 
 hiddenimports = []
 hiddenimports += ["numpy.core", "numpy.core.multiarray"]
@@ -47,6 +53,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
+    icon=str(ICON_FILE),
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -68,6 +75,6 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name=f"{APP_NAME}.app",
-        icon=None,
+        icon=str(ICON_FILE),
         bundle_identifier="com.kist.ir-analyzer",
     )

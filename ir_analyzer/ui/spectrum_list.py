@@ -218,6 +218,7 @@ class SpectrumListWidget(QWidget):
         self._entries: list[SpectrumEntry] = []
         self._potentials: dict[str, float] = {}
         self._session_filter = self.LOOSE_FILES_KEY
+        self._last_selected_paths: dict[str, str] = {}
         self._session_buttons: dict[str, QPushButton] = {}
         self._workspace_keys: list[str] = []
         self._bulk_update_depth = 0
@@ -431,6 +432,7 @@ class SpectrumListWidget(QWidget):
                 self.session_filter_changed.emit(session_key)
             return
 
+        self._remember_current_selection()
         self._session_filter = session_key
         btn = self._session_buttons.get(session_key)
         if btn is not None:
@@ -462,6 +464,26 @@ class SpectrumListWidget(QWidget):
         if emit_signal:
             self.session_filter_changed.emit(self._session_filter)
 
+    def _remember_current_selection(self, session_key: Optional[str] = None):
+        current_row = self.list_widget.currentRow()
+        if current_row < 0:
+            return
+        entry = self.get_entry(current_row)
+        if entry is None:
+            return
+        key = session_key or self._session_key_for_entry(entry)
+        self._last_selected_paths[key] = entry.filepath
+
+    def _last_selected_visible_row(self, visible_rows: list[int]) -> int:
+        last_path = self._last_selected_paths.get(self._session_filter)
+        if not last_path:
+            return -1
+        for row in visible_rows:
+            entry = self.get_entry(row)
+            if entry is not None and entry.filepath == last_path:
+                return row
+        return -1
+
     def _refresh_list_visibility(self):
         visible_rows = []
         for row, entry in enumerate(self._entries):
@@ -484,7 +506,9 @@ class SpectrumListWidget(QWidget):
             self.hint_label.setVisible(False)
             self.hint_label.setText("CSV 파일을 여기에\n드래그하세요")
             if current_row < 0:
-                self.list_widget.setCurrentRow(visible_rows[0])
+                restore_row = self._last_selected_visible_row(visible_rows)
+                self.list_widget.setCurrentRow(
+                    restore_row if restore_row >= 0 else visible_rows[0])
         else:
             self.hint_label.setText(
                 "CSV 파일을 여기에\n드래그하세요"
@@ -694,15 +718,22 @@ class SpectrumListWidget(QWidget):
                 entry = self._entries[row]
                 self.list_widget.takeItem(row)
                 self._entries.pop(row)
+                self._remove_last_selection_for_entry(entry)
                 self.spectrum_removed.emit(row, entry.filepath, entry.name)
         self._rebuild_session_filter_buttons()
         if not self._entries:
             self.hint_label.setVisible(True)
 
+    def _remove_last_selection_for_entry(self, entry: SpectrumEntry):
+        key = self._session_key_for_entry(entry)
+        if self._last_selected_paths.get(key) == entry.filepath:
+            self._last_selected_paths.pop(key, None)
+
     def remove_session(self, session_key: str) -> list[SpectrumEntry]:
         """Remove every spectrum belonging to one sidebar session filter."""
         if session_key in self._workspace_keys:
             self._workspace_keys.remove(session_key)
+        self._last_selected_paths.pop(session_key, None)
         rows = [
             row for row, entry in enumerate(self._entries)
             if self._session_key_for_entry(entry) == session_key
@@ -780,6 +811,7 @@ class SpectrumListWidget(QWidget):
         """모든 스펙트럼 제거 (세션 복원 시 초기화용)"""
         self._entries.clear()
         self._potentials.clear()
+        self._last_selected_paths.clear()
         self._workspace_keys.clear()
         self.list_widget.clear()
         self.potential_table.blockSignals(True)
@@ -791,6 +823,7 @@ class SpectrumListWidget(QWidget):
     def _on_row_changed(self, row: int):
         if row >= 0 and row < len(self._entries):
             entry = self._entries[row]
+            self._remember_current_selection()
             self._select_potential_row_for_name(entry.name)
             self.spectrum_selected.emit(entry)
 
