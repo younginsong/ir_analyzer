@@ -120,10 +120,10 @@ OH 모드의 `Snapshots`는 현재 baseline, peak guess, fit 상태를 저장했
 ## 6. 여러 스펙트럼과 전위 분석
 
 여러 전위에서 측정한 스펙트럼을 분석할 때는 왼쪽 아래
-`POTENTIAL ASSIGNMENTS` 표에 전위값을 입력합니다.
+`POTENTIAL ASSIGNMENTS` 표에서 전위값을 확인하거나 수정합니다.
 
 1. 여러 스펙트럼을 불러옵니다.
-2. 각 스펙트럼 행의 `Potential (V)` 값을 입력합니다.
+2. 각 스펙트럼 행의 `Potential (V)` 값을 확인하거나 수정합니다.
 3. 각 스펙트럼에 대해 OH fit을 실행합니다.
 4. 오른쪽 `Current Summary`의 `Calculate Stark Slopes`를 실행합니다.
 5. 중앙 `Analysis` 탭에서 다음 그래프를 확인합니다.
@@ -133,8 +133,8 @@ OH 모드의 `Snapshots`는 현재 baseline, peak guess, fit 상태를 저장했
 - OH Total Area vs Potential
 - Normalized OH: OH / Si-O vs Potential
 
-전위값이 없거나 파일명에서 전위를 파싱할 수 없으면 Stark 결과가 나오지
-않을 수 있으므로, `POTENTIAL ASSIGNMENTS`를 먼저 확인하세요.
+전위값이 없거나 잘못되어 있으면 Stark 결과가 나오지 않을 수 있으므로,
+`POTENTIAL ASSIGNMENTS`를 먼저 확인하세요.
 
 ## 7. Auto Fit
 
@@ -313,7 +313,7 @@ long-format으로 저장됩니다.
 일반적인 in situ IR 전위 의존성 실험에서는 다음 순서를 권장합니다.
 
 1. 모든 전위 스펙트럼을 불러옵니다.
-2. `POTENTIAL ASSIGNMENTS`를 입력합니다.
+2. `POTENTIAL ASSIGNMENTS`를 확인하거나 수정합니다.
 3. `Total` 모드에서 스펙트럼 순서와 전체 모양을 확인합니다.
 4. 대표 스펙트럼 한두 개로 OH baseline과 peak 조건을 잡습니다.
 5. 모든 스펙트럼을 OH fit합니다.

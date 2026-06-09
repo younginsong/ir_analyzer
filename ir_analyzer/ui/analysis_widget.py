@@ -18,11 +18,8 @@ def _connect_points(pw, xs, ys, color, width=1.5):
     order = np.argsort(xs)
     pw.plot(xs[order], ys[order], pen=pg.mkPen(color, width=width))
 
-from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QLabel, QVBoxLayout,
-                              QGridLayout, QTabWidget, QFrame, QTableWidget,
-                              QTableWidgetItem, QHeaderView, QAbstractItemView)
+from PyQt5.QtWidgets import QWidget, QHBoxLayout, QLabel, QVBoxLayout, QGridLayout, QTabWidget
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
 
 
 PEAK_COLORS = ['#89b4fa', '#fab387', '#cba6f7', '#94e2d5',
@@ -85,9 +82,6 @@ class AnalysisWidget(QWidget):
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-
-        self._sidebar = self._build_sidebar()
-        root.addWidget(self._sidebar)
 
         self._content = QWidget()
         content_layout = QVBoxLayout(self._content)
@@ -159,54 +153,6 @@ class AnalysisWidget(QWidget):
         ol.addWidget(hint)
         self._overlay.setVisible(True)
 
-    def _build_sidebar(self):
-        sidebar = QFrame()
-        sidebar.setObjectName("analysis_sidebar")
-        sidebar.setFixedWidth(280)
-
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
-
-        section = QLabel("Potential Assignments")
-        section.setObjectName("section_label")
-        layout.addWidget(section)
-
-        self._focus_card = QFrame()
-        self._focus_card.setObjectName("analysis_focus_card")
-        focus_layout = QVBoxLayout(self._focus_card)
-        focus_layout.setContentsMargins(12, 12, 12, 12)
-        focus_layout.setSpacing(4)
-
-        caption = QLabel("Focused Spectrum")
-        caption.setObjectName("analysis_focus_caption")
-        focus_layout.addWidget(caption)
-
-        self.focus_spectrum_label = QLabel("No spectrum selected")
-        self.focus_spectrum_label.setObjectName("analysis_focus_name")
-        self.focus_spectrum_label.setWordWrap(True)
-        focus_layout.addWidget(self.focus_spectrum_label)
-
-        self.focus_potential_label = QLabel("— V")
-        self.focus_potential_label.setObjectName("analysis_focus_potential")
-        focus_layout.addWidget(self.focus_potential_label)
-
-        layout.addWidget(self._focus_card)
-
-        self.assignment_table = QTableWidget(0, 2)
-        self.assignment_table.setObjectName("analysis_assignments_table")
-        self.assignment_table.setHorizontalHeaderLabels(["Potential (V)", "Spectrum"])
-        self.assignment_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.assignment_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.assignment_table.verticalHeader().setVisible(False)
-        self.assignment_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.assignment_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.assignment_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.assignment_table.cellClicked.connect(self._on_assignment_clicked)
-        layout.addWidget(self.assignment_table, 1)
-
-        return sidebar
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._overlay.setGeometry(self._content.rect())
@@ -219,83 +165,11 @@ class AnalysisWidget(QWidget):
 
     def set_potential_assignments(self, spectra_names: list, potentials: dict, current_filename: Optional[str] = None):
         self._potentials = dict(potentials or {})
-        self.assignment_table.blockSignals(True)
-        self.assignment_table.setRowCount(len(spectra_names))
-
-        for row, name in enumerate(spectra_names):
-            potential = self._potentials.get(name)
-            potential_text = "—" if potential is None else f"{potential:+.2f}"
-
-            pot_item = QTableWidgetItem(potential_text)
-            pot_item.setData(Qt.UserRole, name)
-            pot_item.setTextAlignment(Qt.AlignCenter)
-            spec_item = QTableWidgetItem(name)
-            spec_item.setData(Qt.UserRole, name)
-
-            self.assignment_table.setItem(row, 0, pot_item)
-            self.assignment_table.setItem(row, 1, spec_item)
-            self.assignment_table.setRowHeight(row, 28)
-
-        self.assignment_table.blockSignals(False)
         self.set_focus_spectrum(current_filename)
 
     def set_focus_spectrum(self, filename: Optional[str]):
         self._focus_filename = filename
-        self._update_focus_card()
-        self._highlight_assignment_row()
         self._apply_focus_highlight()
-
-    def _update_focus_card(self):
-        if self._focus_filename:
-            self.focus_spectrum_label.setText(self._focus_filename)
-            potential = self._potentials.get(self._focus_filename)
-            if potential is None:
-                self.focus_potential_label.setText("— V")
-            else:
-                self.focus_potential_label.setText(f"{potential:+.2f} V")
-        else:
-            self.focus_spectrum_label.setText("No spectrum selected")
-            self.focus_potential_label.setText("— V")
-
-    def _highlight_assignment_row(self):
-        self.assignment_table.blockSignals(True)
-        focus_row = -1
-        for row in range(self.assignment_table.rowCount()):
-            item = self.assignment_table.item(row, 1)
-            name = item.data(Qt.UserRole) if item is not None else None
-            is_focus = bool(self._focus_filename) and name == self._focus_filename
-            for col in range(self.assignment_table.columnCount()):
-                cell = self.assignment_table.item(row, col)
-                if cell is None:
-                    continue
-                font = QFont(cell.font())
-                font.setBold(is_focus)
-                font.setPointSize(13 if is_focus and col == 0 else 11 if col == 0 else 10)
-                cell.setFont(font)
-                cell.setForeground(QColor("#f9e2af" if is_focus and col == 0 else "#cdd6f4"))
-            if is_focus:
-                focus_row = row
-
-        if focus_row >= 0:
-            self.assignment_table.selectRow(focus_row)
-            self.assignment_table.scrollToItem(
-                self.assignment_table.item(focus_row, 0),
-                QAbstractItemView.PositionAtCenter,
-            )
-        else:
-            self.assignment_table.clearSelection()
-            selection_model = self.assignment_table.selectionModel()
-            if selection_model is not None:
-                selection_model.clearCurrentIndex()
-        self.assignment_table.blockSignals(False)
-
-    def _on_assignment_clicked(self, row: int, _column: int):
-        item = self.assignment_table.item(row, 1)
-        if item is None:
-            return
-        name = item.data(Qt.UserRole)
-        if name:
-            self.assignment_selected.emit(name)
 
     def _clear_focus_items(self):
         for plot_widget, item in self._focus_items:

@@ -276,54 +276,6 @@ QAbstractItemView QLineEdit {
     selection-color: #1e1e2e;
 }
 
-/* ── Analysis 탭 좌측 Potential Assignment 패널 ── */
-QFrame#analysis_sidebar {
-    background-color: #181825;
-    border-right: 1px solid #313244;
-}
-QFrame#analysis_focus_card {
-    background-color: #262638;
-    border: 1px solid #45475a;
-    border-radius: 8px;
-}
-QLabel#analysis_focus_caption {
-    color: #89b4fa;
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-QLabel#analysis_focus_name {
-    color: #cdd6f4;
-    font-size: 12px;
-    font-weight: 600;
-}
-QLabel#analysis_focus_potential {
-    color: #f9e2af;
-    font-family: Menlo, Monaco;
-    font-size: 24px;
-    font-weight: 700;
-    padding-top: 2px;
-}
-QTableWidget#analysis_assignments_table {
-    background-color: #1e1e2e;
-    border: 1px solid #313244;
-    border-radius: 8px;
-    gridline-color: #313244;
-}
-QTableWidget#analysis_assignments_table::item {
-    padding: 6px 8px;
-    border-bottom: 1px solid #262638;
-}
-QTableWidget#analysis_assignments_table::item:selected {
-    background-color: #313244;
-    color: #f9e2af;
-}
-QTableWidget#analysis_assignments_table QHeaderView::section {
-    background-color: #181825;
-    color: #89b4fa;
-}
-
 /* ── 상태바 ── */
 QStatusBar {
     background-color: #181825;

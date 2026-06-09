@@ -122,11 +122,11 @@ spectrum.
 
 ## 6. Multiple Spectra And Potential Analysis
 
-For potential-dependent experiments, enter potentials in the
-`POTENTIAL ASSIGNMENTS` table in the left panel.
+For potential-dependent experiments, review or edit potentials in the
+`POTENTIAL ASSIGNMENTS` table at the bottom of the left panel.
 
 1. Load multiple spectra.
-2. Enter `Potential (V)` for each spectrum.
+2. Review or edit `Potential (V)` for each spectrum.
 3. Run OH fitting for each spectrum.
 4. Click `Calculate Stark Slopes` in `Current Summary`.
 5. Review plots in the center `Analysis` tab.
@@ -319,7 +319,7 @@ workflow, then run batch processing.
 For a typical in situ IR potential series:
 
 1. Load all potential-dependent spectra.
-2. Enter `POTENTIAL ASSIGNMENTS`.
+2. Review or edit `POTENTIAL ASSIGNMENTS`.
 3. Use `Total` mode to inspect ordering and overall spectral trends.
 4. Tune OH baseline and peak settings on one or two representative spectra.
 5. Fit OH peaks for all spectra.

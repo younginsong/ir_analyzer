@@ -504,7 +504,8 @@ class SpectrumListWidget(QWidget):
         if self._bulk_update_depth == 1:
             self.setUpdatesEnabled(False)
             self.list_widget.setUpdatesEnabled(False)
-            self.potential_table.setUpdatesEnabled(False)
+            if self.potential_table is not None:
+                self.potential_table.setUpdatesEnabled(False)
 
     def end_bulk_update(self):
         if self._bulk_update_depth <= 0:
@@ -518,7 +519,8 @@ class SpectrumListWidget(QWidget):
                 self._bulk_filter_refresh_pending = False
                 self._rebuild_session_filter_buttons()
         finally:
-            self.potential_table.setUpdatesEnabled(True)
+            if self.potential_table is not None:
+                self.potential_table.setUpdatesEnabled(True)
             self.list_widget.setUpdatesEnabled(True)
             self.setUpdatesEnabled(True)
 
@@ -913,9 +915,10 @@ class SpectrumListWidget(QWidget):
         self._last_selected_paths.clear()
         self._workspace_keys.clear()
         self.list_widget.clear()
-        self.potential_table.blockSignals(True)
-        self.potential_table.setRowCount(0)
-        self.potential_table.blockSignals(False)
+        if self.potential_table is not None:
+            self.potential_table.blockSignals(True)
+            self.potential_table.setRowCount(0)
+            self.potential_table.blockSignals(False)
         self._rebuild_session_filter_buttons()
         self.hint_label.setVisible(True)
 
@@ -929,7 +932,7 @@ class SpectrumListWidget(QWidget):
     def _on_selection_changed(self):
         self.selection_changed.emit(self.get_selected_entries())
 
-    # ── Potential Assignments ─────────────────────────────────
+    # ── Potential state ────────────────────────────────────────
 
     def add_spectrum_potential(self, name: str, potential: float):
         """스펙트럼 추가 시 Potential 상태를 저장하고 현재 필터 뷰를 갱신"""
