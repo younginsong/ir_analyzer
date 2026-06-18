@@ -466,6 +466,52 @@ class MainWindow(QMainWindow):
             if record.get('filename') in visible_names
         ]
 
+    def _all_session_compare_records(self) -> list:
+        potentials = self.spectrum_list.get_potentials()
+        fit_record_by_name = {
+            record.get('filename'): record
+            for record in self._fit_records
+        }
+        records = []
+
+        for entry in self.spectrum_list.get_all_entries():
+            potential = potentials.get(entry.name)
+            if potential is None:
+                continue
+
+            fit_record = fit_record_by_name.get(entry.name)
+            if not fit_record:
+                continue
+            fit_result = fit_record.get('fit_result')
+            if not fit_result or not getattr(fit_result, 'success', False):
+                continue
+
+            fractions = {}
+            for peak in getattr(fit_result, 'peaks', []) or []:
+                try:
+                    fractions[int(peak.index)] = float(peak.area_fraction)
+                except (TypeError, ValueError):
+                    continue
+            if not fractions:
+                continue
+
+            session_key = self.spectrum_list.get_session_key_for_entry(entry)
+            session_label = self.spectrum_list.get_session_label_for_key(session_key)
+            records.append({
+                'session_key': session_key,
+                'session_label': session_label,
+                'filename': entry.name,
+                'potential': float(potential),
+                'area_fractions': fractions,
+            })
+
+        return records
+
+    def _refresh_session_compare(self):
+        self.analysis_widget.update_compare_plot(
+            self._all_session_compare_records()
+        )
+
     def _potential_color(self, entry: SpectrumEntry, potentials: dict,
                          pot_min: float | None, pot_max: float | None) -> str:
         potential = potentials.get(entry.name)
@@ -847,8 +893,6 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, tabs: QTabWidget, index: int):
         if self._suppress_analysis_tab_reset:
             return
-        if index >= 0 and tabs.widget(index) is self.analysis_widget:
-            self.analysis_widget.set_current_subtab('OH')
 
     def _update_split_button(self):
         if not hasattr(self, '_btn_split'):
@@ -2586,6 +2630,7 @@ class MainWindow(QMainWindow):
             self._stark_results = []
             self.right_panel.update_stark_results([])
             self.analysis_widget.update_plots([], potentials, [])
+            self._refresh_session_compare()
             return
 
         results = calculate_stark_slopes(
@@ -2598,6 +2643,7 @@ class MainWindow(QMainWindow):
         if self._visible_sio_areas():
             self.analysis_widget.update_oh_normalized(
                 fit_records, self._visible_sio_areas(), potentials)
+        self._refresh_session_compare()
 
     # ── Export ────────────────────────────────────────────────
 
@@ -3174,6 +3220,7 @@ class MainWindow(QMainWindow):
             self.analysis_widget.update_plots([], {}, [])
             self.analysis_widget.update_co_plots([], {}, [])
             self.analysis_widget.update_co_stark_results([])
+            self.analysis_widget.update_compare_plot([])
             self.setWindowTitle("In Situ IR Analyzer")
             self._sync_analysis_sidebar()
         finally:
@@ -3476,6 +3523,7 @@ class MainWindow(QMainWindow):
                 self.analysis_widget.update_oh_normalized(
                     self._visible_fit_records(), self._visible_sio_areas(), self._visible_potentials())
 
+        self._refresh_session_compare()
         self._loading_session = False
 
         # 세션을 열면 전체 스펙트럼 비교 화면을 먼저 보여준다.

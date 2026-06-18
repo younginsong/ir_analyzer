@@ -18,12 +18,27 @@ def _connect_points(pw, xs, ys, color, width=1.5):
     order = np.argsort(xs)
     pw.plot(xs[order], ys[order], pen=pg.mkPen(color, width=width))
 
-from PyQt5.QtWidgets import QWidget, QHBoxLayout, QLabel, QVBoxLayout, QGridLayout, QTabWidget
+from PyQt5.QtWidgets import (
+    QWidget, QHBoxLayout, QLabel, QVBoxLayout, QGridLayout, QTabWidget,
+    QComboBox,
+)
 from PyQt5.QtCore import Qt, pyqtSignal
 
 
 PEAK_COLORS = ['#89b4fa', '#fab387', '#cba6f7', '#94e2d5',
                '#f9e2af', '#a6e3a1', '#89dceb', '#f38ba8']
+SESSION_COLORS = ['#89b4fa', '#a6e3a1', '#fab387', '#f38ba8',
+                  '#cba6f7', '#94e2d5', '#f9e2af', '#89dceb']
+COMPARE_METRICS = [
+    ('P1', (0,)),
+    ('P2', (1,)),
+    ('P3', (2,)),
+    ('P4', (3,)),
+    ('P1+P2', (0, 1)),
+    ('P3+P4', (2, 3)),
+]
+COMPARE_METRIC_MAP = dict(COMPARE_METRICS)
+DEFAULT_COMPARE_METRIC = 'P3+P4'
 
 
 def _style_pw(pw, title, xlabel, ylabel):
@@ -76,6 +91,7 @@ class AnalysisWidget(QWidget):
         self._sio_areas = {}
         self._focus_filename = None
         self._focus_items = []
+        self._compare_records = []
         self._build_ui()
 
     def _build_ui(self):
@@ -94,8 +110,8 @@ class AnalysisWidget(QWidget):
         root.addWidget(self._content, 1)
 
         # ── OH 서브탭 ──────────────────────────────────────────
-        oh_widget = QWidget()
-        oh_grid = QGridLayout(oh_widget)
+        self._oh_widget = QWidget()
+        oh_grid = QGridLayout(self._oh_widget)
         oh_grid.setContentsMargins(6, 6, 6, 6)
         oh_grid.setSpacing(8)
 
@@ -115,11 +131,11 @@ class AnalysisWidget(QWidget):
         oh_grid.setRowStretch(0, 1)
         oh_grid.setRowStretch(1, 1)
 
-        self._tabs.addTab(oh_widget, "  OH  ")
+        self._tabs.addTab(self._oh_widget, "  OH  ")
 
         # ── CO 서브탭 ──────────────────────────────────────────
-        co_widget = QWidget()
-        co_grid = QGridLayout(co_widget)
+        self._co_widget = QWidget()
+        co_grid = QGridLayout(self._co_widget)
         co_grid.setContentsMargins(6, 6, 6, 6)
         co_grid.setSpacing(8)
 
@@ -139,7 +155,43 @@ class AnalysisWidget(QWidget):
         co_grid.setRowStretch(0, 1)
         co_grid.setRowStretch(1, 1)
 
-        self._tabs.addTab(co_widget, "  CO  ")
+        self._tabs.addTab(self._co_widget, "  CO  ")
+
+        # ── Compare 서브탭 ─────────────────────────────────────
+        self._compare_widget = QWidget()
+        compare_layout = QVBoxLayout(self._compare_widget)
+        compare_layout.setContentsMargins(6, 6, 6, 6)
+        compare_layout.setSpacing(8)
+
+        compare_controls = QHBoxLayout()
+        compare_controls.setContentsMargins(0, 0, 0, 0)
+        compare_controls.setSpacing(6)
+        metric_label = QLabel("Metric")
+        metric_label.setStyleSheet("color: #a6adc8;")
+        self.compare_metric_combo = QComboBox()
+        self.compare_metric_combo.setObjectName("analysis_compare_metric_combo")
+        for label, _indices in COMPARE_METRICS:
+            self.compare_metric_combo.addItem(label, label)
+        default_index = self.compare_metric_combo.findData(DEFAULT_COMPARE_METRIC)
+        if default_index >= 0:
+            self.compare_metric_combo.setCurrentIndex(default_index)
+        self.compare_metric_combo.currentIndexChanged.connect(
+            self._on_compare_metric_changed
+        )
+
+        compare_controls.addWidget(metric_label)
+        compare_controls.addWidget(self.compare_metric_combo)
+        compare_controls.addStretch(1)
+        compare_layout.addLayout(compare_controls)
+
+        self.compare_pw = _make_pw(
+            f'{DEFAULT_COMPARE_METRIC} Area Fraction by Sample',
+            'Potential (V)',
+            'Area Fraction (%)',
+        )
+        compare_layout.addWidget(self.compare_pw, 1)
+
+        self._tabs.addTab(self._compare_widget, "  Compare  ")
 
         # 초기 안내 레이블
         self._overlay = QWidget(self._content)
@@ -158,10 +210,24 @@ class AnalysisWidget(QWidget):
         self._overlay.setGeometry(self._content.rect())
 
     def get_current_subtab(self) -> str:
-        return 'CO' if self._tabs.currentIndex() == 1 else 'OH'
+        widget = self._tabs.currentWidget()
+        if widget is getattr(self, '_co_widget', None):
+            return 'CO'
+        if widget is getattr(self, '_compare_widget', None):
+            return 'Compare'
+        index = self._tabs.currentIndex()
+        if index == 1:
+            return 'CO'
+        if index == 2:
+            return 'Compare'
+        return 'OH'
 
     def set_current_subtab(self, subtab: str):
-        self._tabs.setCurrentIndex(1 if subtab == 'CO' else 0)
+        index = {'OH': 0, 'CO': 1, 'Compare': 2}.get(subtab, 0)
+        self._tabs.setCurrentIndex(index)
+
+    def _on_compare_metric_changed(self, _index: int):
+        self._redraw_compare_plot()
 
     def set_potential_assignments(self, spectra_names: list, potentials: dict, current_filename: Optional[str] = None):
         self._potentials = dict(potentials or {})
@@ -406,6 +472,91 @@ class AnalysisWidget(QWidget):
             if len(xs) >= 2:
                 _connect_points(self.oh_norm_pw, xs, ys, '#a6e3a1')
         self._apply_focus_highlight()
+
+    # ── Sample comparison 업데이트 ─────────────────────────────
+
+    def update_compare_plot(self, compare_records: list):
+        """
+        compare_records:
+        [{
+            'session_label': str,
+            'filename': str,
+            'potential': float,
+            'area_fractions': {peak_index: area_fraction_percent}
+        }]
+        """
+        self._compare_records = list(compare_records or [])
+        if self._compare_records:
+            self._overlay.setVisible(False)
+        self._redraw_compare_plot()
+
+    def _selected_compare_metric(self) -> str:
+        key = self.compare_metric_combo.currentData()
+        return key or DEFAULT_COMPARE_METRIC
+
+    def _compare_metric_value(self, record: dict, peak_indices: tuple[int, ...]):
+        fractions = record.get('area_fractions') or {}
+        values = []
+        for idx in peak_indices:
+            if idx not in fractions:
+                return None
+            values.append(float(fractions[idx]))
+        return sum(values)
+
+    def _redraw_compare_plot(self):
+        metric = self._selected_compare_metric()
+        peak_indices = COMPARE_METRIC_MAP.get(metric, ())
+        self.compare_pw.setTitle(
+            f'{metric} Area Fraction by Sample',
+            color='#a6adc8',
+            size='12px',
+        )
+        legend = _reset_legend(self.compare_pw)
+
+        grouped = defaultdict(lambda: {'V': [], 'area': [], 'filenames': []})
+        for record in self._compare_records:
+            potential = record.get('potential')
+            if potential is None:
+                continue
+            value = self._compare_metric_value(record, peak_indices)
+            if value is None:
+                continue
+            label = record.get('session_label') or 'Loose Files'
+            grouped[label]['V'].append(float(potential))
+            grouped[label]['area'].append(float(value))
+            grouped[label]['filenames'].append(record.get('filename', ''))
+
+        if not grouped:
+            try:
+                if legend.scene() is not None:
+                    legend.scene().removeItem(legend)
+            except Exception:
+                pass
+            return
+
+        for session_idx, session_label in enumerate(grouped.keys()):
+            color = SESSION_COLORS[session_idx % len(SESSION_COLORS)]
+            values = grouped[session_label]
+            xs = np.array(values['V'])
+            ys = np.array(values['area'])
+            order = np.argsort(xs)
+            xs = xs[order]
+            ys = ys[order]
+
+            self.compare_pw.plot(
+                xs, ys,
+                pen=None,
+                symbol='o',
+                symbolSize=10,
+                symbolBrush=pg.mkBrush(color),
+                symbolPen=pg.mkPen('#1e1e2e', width=1),
+                name=session_label,
+            )
+            if len(xs) >= 2:
+                self.compare_pw.plot(
+                    xs, ys,
+                    pen=pg.mkPen(color, width=1.8),
+                )
 
     def _update_oh_total(self, fit_records: list, potentials: dict):
         """OH total area vs Potential 플롯"""
