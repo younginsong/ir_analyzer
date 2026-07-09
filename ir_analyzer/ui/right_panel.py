@@ -342,10 +342,6 @@ class RightPanel(QWidget):
         enabled = self.combo_oh_overlay_intensity.currentText() == "Normalize"
         self.spin_oh_norm_min.setEnabled(enabled)
         self.spin_oh_norm_max.setEnabled(enabled)
-        if hasattr(self, 'cb_total_shift'):
-            if enabled:
-                self.cb_total_shift.setChecked(False)
-            self.cb_total_shift.setEnabled(not enabled)
         self.oh_overlay_intensity_changed.emit()
 
     def _build_oh_peaks_page(self):

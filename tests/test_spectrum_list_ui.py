@@ -156,6 +156,56 @@ class SpectrumListUiTests(unittest.TestCase):
             source.close()
             target.close()
 
+    def test_same_dpt_file_can_be_loaded_into_different_session_tabs(self):
+        widget = SpectrumListWidget()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dpt_path = Path(tmpdir) / "shared.dpt"
+                dpt_path.write_text(
+                    "1400 0.1\n1300 0.2\n1200 0.3\n",
+                    encoding="utf-8",
+                )
+
+                first = widget.add_file(str(dpt_path))
+                session_key = widget.create_workspace()
+                second = widget.add_file(str(dpt_path))
+
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                self.assertEqual(len(widget.get_all_entries()), 2)
+                self.assertEqual(
+                    widget.get_session_key_for_entry(first),
+                    widget.LOOSE_FILES_KEY,
+                )
+                self.assertEqual(
+                    widget.get_session_key_for_entry(second),
+                    session_key,
+                )
+                self.assertEqual(first.source_spectrum_path, str(dpt_path))
+                self.assertEqual(second.source_spectrum_path, str(dpt_path))
+                self.assertNotEqual(first.filepath, second.filepath)
+        finally:
+            widget.close()
+
+    def test_same_dpt_file_is_still_ignored_within_one_session_tab(self):
+        widget = SpectrumListWidget()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dpt_path = Path(tmpdir) / "duplicate.dpt"
+                dpt_path.write_text(
+                    "1400 0.1\n1300 0.2\n1200 0.3\n",
+                    encoding="utf-8",
+                )
+
+                first = widget.add_file(str(dpt_path))
+                second = widget.add_file(str(dpt_path))
+
+                self.assertIsNotNone(first)
+                self.assertIsNone(second)
+                self.assertEqual(len(widget.get_all_entries()), 1)
+        finally:
+            widget.close()
+
     def test_analysis_subtab_is_preserved_when_returning_from_spectrum(self):
         window = MainWindow()
         try:
@@ -571,7 +621,7 @@ class SpectrumListUiTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_total_normalize_zeroes_and_scales_corrected_spectra_for_overlay(self):
+    def test_total_normalize_preserves_zero_and_scales_corrected_spectra_for_overlay(self):
         window = MainWindow()
         try:
             window.right_panel.set_mode("Total")
@@ -580,8 +630,8 @@ class SpectrumListUiTests(unittest.TestCase):
             window.right_panel.spin_oh_norm_max.setValue(3990.0)
             wn = np.linspace(1500.0, 4000.0, 251)
             shape = np.exp(-((wn - 3350.0) / 200.0) ** 2)
-            corrected_one = 0.08 + 0.20 * shape
-            corrected_two = -0.03 + 0.05 * shape
+            corrected_one = 0.20 * shape
+            corrected_two = 0.05 * shape
             entry_one = SpectrumEntry(
                 "/tmp/norm-one.dpt", "norm-one.dpt", wn, corrected_one, "#89b4fa")
             entry_two = SpectrumEntry(
@@ -603,15 +653,15 @@ class SpectrumListUiTests(unittest.TestCase):
                 entry_two, wn, corrected_two)
 
             mask = (wn >= 3000.0) & (wn <= 3990.0)
-            self.assertAlmostEqual(float(np.nanmin(display_one[mask])), 0.0, places=6)
-            self.assertAlmostEqual(float(np.nanmin(display_two[mask])), 0.0, places=6)
             self.assertAlmostEqual(float(np.nanmax(display_one[mask])), 1.0, places=6)
             self.assertAlmostEqual(float(np.nanmax(display_two[mask])), 1.0, places=6)
+            self.assertAlmostEqual(float(display_one[0]), 0.0, places=5)
+            self.assertAlmostEqual(float(display_two[0]), 0.0, places=5)
             np.testing.assert_allclose(display_one, display_two, atol=1e-6)
         finally:
             window.close()
 
-    def test_total_normalize_ignores_saved_manual_shifts(self):
+    def test_total_normalize_uses_saved_shift_only_when_shift_mode_is_on(self):
         window = MainWindow()
         try:
             wn = np.linspace(1500.0, 4000.0, 251)
@@ -625,10 +675,12 @@ class SpectrumListUiTests(unittest.TestCase):
             session_key = window.spectrum_list.get_current_session_filter()
             window._total_shifts[session_key] = {entry.name: 0.25}
 
-            spec = window._build_total_specs()[0]
+            self.assertTrue(window.right_panel.cb_total_shift.isEnabled())
+            self.assertEqual(window._build_total_specs()[0]["shift"], 0.0)
 
-            self.assertEqual(spec["shift"], 0.0)
-            self.assertFalse(window.right_panel.cb_total_shift.isEnabled())
+            window.right_panel.cb_total_shift.setChecked(True)
+
+            self.assertEqual(window._build_total_specs()[0]["shift"], 0.25)
         finally:
             window.close()
 

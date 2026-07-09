@@ -702,21 +702,8 @@ class MainWindow(QMainWindow):
         wn_arr = np.asarray(wn, dtype=float)
         return (wn_arr >= cfg['wn_min']) & (wn_arr <= cfg['wn_max'])
 
-    def _total_normalization_offset(self, wn, reference_ab) -> float:
+    def _total_normalization_divisor(self, wn, reference_ab) -> float:
         active_ab = self._mask_total_inactive_ranges(wn, reference_ab)
-        mask = self._total_normalization_range_mask(wn)
-        n = min(len(mask), len(active_ab))
-        if n == 0:
-            return 0.0
-        finite = np.asarray(active_ab[:n], dtype=float)[mask[:n]]
-        finite = finite[np.isfinite(finite)]
-        if len(finite) == 0:
-            return 0.0
-        return float(np.min(finite))
-
-    def _total_normalization_divisor(self, wn, reference_ab, offset: float = 0.0) -> float:
-        active_ab = self._mask_total_inactive_ranges(
-            wn, np.asarray(reference_ab, dtype=float) - float(offset))
         max_value = self._max_in_wavenumber_range(
             wn,
             active_ab,
@@ -731,9 +718,8 @@ class MainWindow(QMainWindow):
         cfg = self.right_panel.get_oh_overlay_intensity_config()
         if cfg['mode'] != 'normalize':
             return values
-        offset = self._total_normalization_offset(wn, reference_ab)
-        divisor = self._total_normalization_divisor(wn, reference_ab, offset)
-        return (np.asarray(values, dtype=float) - offset) / divisor
+        divisor = self._total_normalization_divisor(wn, reference_ab)
+        return np.asarray(values, dtype=float) / divisor
 
     def _total_state_has_effective_baseline(self, entry: SpectrumEntry) -> bool:
         state = self._total_baseline_states.get(entry.filepath, {})
@@ -823,10 +809,7 @@ class MainWindow(QMainWindow):
         potentials = self._visible_potentials()
         session_key = self.spectrum_list.get_current_session_filter()
         session_shifts = self._total_shifts.get(session_key, {})
-        allow_manual_shift = (
-            self.right_panel.is_total_shift_enabled()
-            and self.right_panel.get_oh_overlay_intensity_config()['mode'] != 'normalize'
-        )
+        allow_manual_shift = self.right_panel.is_total_shift_enabled()
         pot_values = [potentials[e.name] for e in entries if e.name in potentials]
         pot_min = min(pot_values) if pot_values else None
         pot_max = max(pot_values) if pot_values else None
@@ -1696,9 +1679,6 @@ class MainWindow(QMainWindow):
     def _on_oh_overlay_intensity_changed(self):
         if self.right_panel.get_mode() != 'Total':
             return
-        if self.right_panel.get_oh_overlay_intensity_config()['mode'] == 'normalize':
-            self.plot_widget.set_total_shift_mode(False)
-            self.right_panel.set_total_shift_checked(False)
         self._apply_total_view(preserve_view=True)
 
     def _get_oh_snapshots(self, filepath: str | None = None):

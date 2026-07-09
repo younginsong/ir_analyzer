@@ -345,6 +345,36 @@ class SpectrumListWidget(QWidget):
         label = (entry.source_session_label or "").strip()
         return label if label else self.LOOSE_FILES_KEY
 
+    def _source_path_for_entry(self, entry: SpectrumEntry) -> str:
+        return entry.source_spectrum_path or entry.filepath
+
+    def _entry_with_source_in_session(self, source_path: str, session_key: str) -> Optional[SpectrumEntry]:
+        return next(
+            (
+                entry for entry in self._entries
+                if self._session_key_for_entry(entry) == session_key
+                and self._source_path_for_entry(entry) == source_path
+            ),
+            None,
+        )
+
+    def _unique_entry_filepath(self, source_path: str, session_key: str) -> str:
+        existing_paths = {entry.filepath for entry in self._entries}
+        if source_path not in existing_paths:
+            return source_path
+
+        safe_session = "".join(
+            ch if ch.isalnum() or ch in (" ", ".", "_", "-") else "_"
+            for ch in (session_key or self.LOOSE_FILES_KEY)
+        ).strip() or self.LOOSE_FILES_KEY
+        base = f"{source_path}#session={safe_session}"
+        candidate = base
+        suffix = 2
+        while candidate in existing_paths:
+            candidate = f"{base}#{suffix}"
+            suffix += 1
+        return candidate
+
     def _session_label_for_key(self, session_key: str) -> str:
         if session_key == self.LOOSE_FILES_KEY:
             return "Loose Files"
@@ -702,7 +732,8 @@ class SpectrumListWidget(QWidget):
         # macOS AppleDouble 메타데이터 파일 무시
         if Path(filepath).name.startswith('._'):
             return None
-        if any(e.filepath == filepath for e in self._entries):
+        session_key = self._session_filter
+        if self._entry_with_source_in_session(filepath, session_key) is not None:
             return None
         try:
             wn, ab = load_spectrum(filepath)
@@ -712,7 +743,6 @@ class SpectrumListWidget(QWidget):
                                 f"{Path(filepath).name}\n\n{e}")
             return None
 
-        session_key = self._session_filter
         session_label = "" if session_key == self.LOOSE_FILES_KEY else self._session_label_for_key(session_key)
         original_name = Path(filepath).name
         base_name = f"{session_label} :: {original_name}" if session_label else original_name
@@ -725,7 +755,7 @@ class SpectrumListWidget(QWidget):
 
         color = SPECTRUM_COLORS[len(self._entries) % len(SPECTRUM_COLORS)]
         entry = SpectrumEntry(
-            filepath=filepath,
+            filepath=self._unique_entry_filepath(filepath, session_key),
             name=display_name,
             wavenumber=wn,
             absorbance=ab,
