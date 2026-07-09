@@ -4,8 +4,6 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 APP_DIR="$SCRIPT_DIR/ir_analyzer"
-RUN_DIR="$HOME/.cache/ir_analyzer_runtime"
-TMP_RUN_DIR="${RUN_DIR}.tmp"
 VENV_DIR="$HOME/.venvs/ir_analyzer"
 VENV_PY="$VENV_DIR/bin/python"
 QT_PLUGINS_DIR="$(find "$VENV_DIR/lib" -path '*PyQt5/Qt5/plugins' -type d -print -quit)"
@@ -26,19 +24,5 @@ fi
 
 export PYTHONDONTWRITEBYTECODE=1
 
-rm -rf "$TMP_RUN_DIR"
-mkdir -p "$TMP_RUN_DIR"
-cp -X "$APP_DIR/main.py" "$APP_DIR/requirements.txt" "$TMP_RUN_DIR/"
-for module_dir in ui core batch; do
-  mkdir -p "$TMP_RUN_DIR/$module_dir"
-  find "$APP_DIR/$module_dir" -type f -name '*.py' -print | while IFS= read -r src; do
-    rel="${src#$APP_DIR/}"
-    mkdir -p "$TMP_RUN_DIR/${rel:h}"
-    cp -X "$src" "$TMP_RUN_DIR/$rel"
-  done
-done
-rm -rf "$RUN_DIR"
-mv "$TMP_RUN_DIR" "$RUN_DIR"
-
-cd "$RUN_DIR"
-exec "$VENV_PY" "$RUN_DIR/main.py" "$@"
+cd "$APP_DIR"
+exec "$VENV_PY" "$APP_DIR/main.py" "$@"

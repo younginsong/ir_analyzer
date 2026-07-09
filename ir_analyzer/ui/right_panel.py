@@ -18,6 +18,7 @@ from core.fitter import FitResult
 
 PEAK_COLORS = ['#89b4fa', '#fab387', '#cba6f7', '#94e2d5',
                '#f9e2af', '#a6e3a1', '#89dceb', '#f38ba8']
+CO_ASSIGNMENTS = ["Unassigned", "CO_L", "CO_B", "OH bending", "Other"]
 
 
 class _PeakTableWidget(QTableWidget):
@@ -43,11 +44,13 @@ class RightPanel(QWidget):
     co_locks_changed       = pyqtSignal(list)
     co_peaks_cleared       = pyqtSignal()
     co_peak_rows_deleted   = pyqtSignal(list)
+    co_peak_add_mode_toggled = pyqtSignal(bool)
     region_changed        = pyqtSignal(float, float)
     baseline_mode_toggled = pyqtSignal(bool)           # Edit Baseline ON/OFF
     baseline_apply        = pyqtSignal(str, dict)      # (algo, params)
     baseline_undo         = pyqtSignal()
     baseline_clear        = pyqtSignal()
+    baseline_point_mode_changed = pyqtSignal(str)
     plot_auto_range       = pyqtSignal()
     plot_export           = pyqtSignal()
     plot_x_auto           = pyqtSignal(bool)
@@ -62,6 +65,7 @@ class RightPanel(QWidget):
     total_shift_toggled   = pyqtSignal(bool)
     total_probe_toggled   = pyqtSignal(bool)
     total_reset_shifts    = pyqtSignal()
+    oh_overlay_intensity_changed = pyqtSignal()
     snapshot_save_requested = pyqtSignal()
     snapshot_restore_requested = pyqtSignal(int)
     snapshot_delete_requested = pyqtSignal(int)
@@ -132,6 +136,7 @@ class RightPanel(QWidget):
 
         # 분석 영역
         region_grp = QGroupBox("Analysis Region")
+        self._region_group = region_grp
         form = QFormLayout()
         form.setSpacing(6)
 
@@ -164,6 +169,7 @@ class RightPanel(QWidget):
 
         # 베이스라인
         bl_grp = QGroupBox("Baseline")
+        self._baseline_group = bl_grp
         bl_layout = QVBoxLayout()
         bl_layout.setSpacing(6)
         bl_layout.setContentsMargins(6, 6, 6, 6)
@@ -183,9 +189,18 @@ class RightPanel(QWidget):
 
         self.combo_bl_algo = QComboBox()
         self.combo_bl_algo.addItems(
-            ["OH Auto Baseline", "Manual", "Rubber Band", "ARPLS", "SNIP", "Linear"])
+            ["Manual", "Rubber Band", "ARPLS", "SNIP", "Linear"])
         self.combo_bl_algo.currentTextChanged.connect(self._on_bl_algo_changed)
         bl_form.addRow("Algorithm:", self.combo_bl_algo)
+
+        self.combo_bl_point_mode = QComboBox()
+        self.combo_bl_point_mode.addItems(["Follow Spectrum", "Free"])
+        self.combo_bl_point_mode.currentTextChanged.connect(
+            lambda txt: self.baseline_point_mode_changed.emit(
+                "free" if txt == "Free" else "follow"
+            )
+        )
+        bl_form.addRow("Point Mode:", self.combo_bl_point_mode)
 
         # ARPLS λ
         self.lbl_lam = QLabel("λ (smoothness):")
@@ -225,7 +240,7 @@ class RightPanel(QWidget):
         bl_grp.setLayout(bl_layout)
 
         # 초기 파라미터 위젯 가시성 설정
-        self._update_bl_param_visibility("OH Auto Baseline")
+        self._update_bl_param_visibility("Manual")
 
         # 플롯 뷰 컨트롤 (기존 우클릭 메뉴 대체)
         view_grp = QGroupBox("Plot View")
@@ -277,17 +292,19 @@ class RightPanel(QWidget):
         # 세로 스크롤바가 생겨도 가로폭이 줄어들지 않도록 최소 폭 고정
         w.setMinimumWidth(295)
         scroll.setWidget(w)
+        bl_grp.setVisible(self._current_mode == 'Total')
         return scroll
 
     # ── Baseline 내부 핸들러 ──────────────────────────────────
 
     def _on_bl_mode_toggled(self, checked: bool):
+        if self._current_mode != 'Total':
+            self._bl_panel.setVisible(False)
+            return
         self._bl_panel.setVisible(checked)
         # 버튼 텍스트로 상태 표시
         self.btn_edit_bl.setText("▣ Editing Baseline…" if checked else "Edit Baseline")
         self.baseline_mode_toggled.emit(checked)
-        if checked:
-            self._emit_bl_apply()
 
     def _on_bl_algo_changed(self, algo: str):
         self._update_bl_param_visibility(algo)
@@ -295,14 +312,20 @@ class RightPanel(QWidget):
 
     def _update_bl_param_visibility(self, algo: str):
         is_manual = (algo == "Manual")
-        is_oh_auto = (algo == "OH Auto Baseline")
         is_arpls   = (algo == "ARPLS")
         is_snip    = (algo == "SNIP")
-        self._bl_manual_widget.setVisible(is_manual or is_oh_auto)
+        self._bl_manual_widget.setVisible(is_manual)
+        self.combo_bl_point_mode.setVisible(is_manual)
+        label = self._bl_panel.layout().labelForField(self.combo_bl_point_mode)
+        if label is not None:
+            label.setVisible(is_manual)
         self.lbl_lam.setVisible(is_arpls)
         self.spin_lam.setVisible(is_arpls)
         self.lbl_iter.setVisible(is_snip)
         self.spin_iter.setVisible(is_snip)
+
+    def get_baseline_point_mode(self) -> str:
+        return "free" if self.combo_bl_point_mode.currentText() == "Free" else "follow"
 
     def _emit_bl_apply(self):
         if not self.btn_edit_bl.isChecked():
@@ -314,6 +337,16 @@ class RightPanel(QWidget):
         elif algo == "SNIP":
             params['n_iter'] = self.spin_iter.value()
         self.baseline_apply.emit(algo, params)
+
+    def _on_oh_overlay_intensity_changed(self):
+        enabled = self.combo_oh_overlay_intensity.currentText() == "Normalize"
+        self.spin_oh_norm_min.setEnabled(enabled)
+        self.spin_oh_norm_max.setEnabled(enabled)
+        if hasattr(self, 'cb_total_shift'):
+            if enabled:
+                self.cb_total_shift.setChecked(False)
+            self.cb_total_shift.setEnabled(not enabled)
+        self.oh_overlay_intensity_changed.emit()
 
     def _build_oh_peaks_page(self):
         w = QWidget()
@@ -447,8 +480,8 @@ class RightPanel(QWidget):
         layout.setSpacing(10)
 
         info = QLabel(
-            "로드된 모든 스펙트럼을 한 번에 비교합니다.\n"
-            "우클릭 메뉴에서도 Shift / 좌표 모드를 켤 수 있습니다."
+            "왼쪽 목록에서 선택한 스펙트럼만 비교합니다.\n"
+            "Baseline과 normalize는 선택된 스펙트럼에 적용됩니다."
         )
         info.setStyleSheet("color: #a6adc8; font-size: 11px;")
         layout.addWidget(info)
@@ -476,6 +509,40 @@ class RightPanel(QWidget):
         btn_reset.setObjectName("btn_flat")
         btn_reset.clicked.connect(self.total_reset_shifts.emit)
         layout.addWidget(btn_reset)
+
+        intensity_grp = QGroupBox("Overlay Intensity")
+        intensity_layout = QVBoxLayout()
+        intensity_layout.setContentsMargins(6, 6, 6, 6)
+        intensity_layout.setSpacing(6)
+
+        intensity_form = QFormLayout()
+        intensity_form.setSpacing(6)
+        self.combo_oh_overlay_intensity = QComboBox()
+        self.combo_oh_overlay_intensity.addItems(["Original", "Normalize"])
+        self.combo_oh_overlay_intensity.currentTextChanged.connect(
+            lambda _txt: self._on_oh_overlay_intensity_changed())
+        intensity_form.addRow("Mode:", self.combo_oh_overlay_intensity)
+
+        self.spin_oh_norm_min = QDoubleSpinBox()
+        self.spin_oh_norm_min.setRange(0, 10000)
+        self.spin_oh_norm_min.setValue(3000)
+        self.spin_oh_norm_min.setSuffix("  cm⁻¹")
+        self.spin_oh_norm_min.valueChanged.connect(
+            lambda _value: self.oh_overlay_intensity_changed.emit())
+
+        self.spin_oh_norm_max = QDoubleSpinBox()
+        self.spin_oh_norm_max.setRange(0, 10000)
+        self.spin_oh_norm_max.setValue(3990)
+        self.spin_oh_norm_max.setSuffix("  cm⁻¹")
+        self.spin_oh_norm_max.valueChanged.connect(
+            lambda _value: self.oh_overlay_intensity_changed.emit())
+
+        intensity_form.addRow("Min:", self.spin_oh_norm_min)
+        intensity_form.addRow("Max:", self.spin_oh_norm_max)
+        intensity_layout.addLayout(intensity_form)
+        intensity_grp.setLayout(intensity_layout)
+        layout.addWidget(intensity_grp)
+        self._on_oh_overlay_intensity_changed()
 
         tip = QLabel("색상은 Potential 값 기준이며, 값이 없으면 목록 색상을 사용합니다.")
         tip.setStyleSheet("color: #6c7086; font-size: 11px;")
@@ -592,25 +659,24 @@ class RightPanel(QWidget):
         layout.setSpacing(10)
 
         info = QLabel(
-            "CO 탭 진입 시 전체 스펙트럼을 자동 분석합니다.\n"
-            "겹침이 의심되는 CO_B만 2-peak deconvolution으로 처리하고,\n"
-            "필요한 스펙트럼만 endpoint 드래그 후 재분석하세요."
+            "CO view는 선택한 spectrum 전체를 보여줍니다.\n"
+            "Total corrected spectrum이 없으면 raw data를 그대로 사용합니다.\n"
+            "Fit 후 각 피크의 Assign 값을 지정하면 CO_L/CO_B summary에 반영됩니다."
         )
         info.setStyleSheet("color: #a6adc8; font-size: 11px;")
         layout.addWidget(info)
 
         fit_mode_row = QHBoxLayout()
-        fit_mode_row.addWidget(QLabel("CO_B Handling:"))
+        self.lbl_co_b_mode = QLabel("CO_B Handling:")
+        fit_mode_row.addWidget(self.lbl_co_b_mode)
         self.combo_co_b_mode = QComboBox()
-        self.combo_co_b_mode.addItems([
-            "Auto (Recommended)",
-            "Always 2-Peak",
-            "Simple Only",
-        ])
-        self.combo_co_b_mode.setCurrentIndex(2)
+        self.combo_co_b_mode.addItems(["Manual Assignment"])
+        self.combo_co_b_mode.setCurrentIndex(0)
         self.combo_co_b_mode.currentTextChanged.connect(self._on_co_b_mode_changed)
         fit_mode_row.addWidget(self.combo_co_b_mode)
         layout.addLayout(fit_mode_row)
+        self.lbl_co_b_mode.setVisible(False)
+        self.combo_co_b_mode.setVisible(False)
 
         self._co_b_deconv_grp = QWidget()
         deconv_layout = QVBoxLayout(self._co_b_deconv_grp)
@@ -624,39 +690,48 @@ class RightPanel(QWidget):
         shape_row.addWidget(self.combo_shape_co)
         deconv_layout.addLayout(shape_row)
 
-        btn_detect_co_b = QPushButton("🔍  Refine CO_B Peaks")
+        btn_detect_co_b = QPushButton("🔍  Auto Guess Peaks")
         btn_detect_co_b.setObjectName("btn_primary")
         btn_detect_co_b.clicked.connect(self.auto_detect_co_b_requested.emit)
         deconv_layout.addWidget(btn_detect_co_b)
 
-        co_grp = QGroupBox("CO_B Parameters")
+        self.btn_co_add_peak = QPushButton("＋  Add Peak Mode")
+        self.btn_co_add_peak.setCheckable(True)
+        self.btn_co_add_peak.setObjectName("btn_flat")
+        self.btn_co_add_peak.setToolTip("플롯에서 클릭 또는 우클릭+드래그로 CO 피크를 수동 생성")
+        self.btn_co_add_peak.toggled.connect(self.co_peak_add_mode_toggled.emit)
+        deconv_layout.addWidget(self.btn_co_add_peak)
+
+        co_grp = QGroupBox("CO Peaks")
         co_grp_layout = QVBoxLayout()
         co_grp_layout.setContentsMargins(6, 6, 6, 6)
         co_grp_layout.setSpacing(6)
-        lock_hint = QLabel("Edit values or drag plot handles, then Reanalyze Current.")
+        lock_hint = QLabel("Assign labels after fitting; summary uses assigned CO_L/CO_B only.")
         lock_hint.setStyleSheet("color: #6c7086; font-size: 11px;")
         lock_hint.setWordWrap(True)
         co_grp_layout.addWidget(lock_hint)
 
-        self.co_init_table = _PeakTableWidget(0, 8)
+        self.co_init_table = _PeakTableWidget(0, 9)
         self.co_init_table.setHorizontalHeaderLabels(
-            ["", "Shape", "Center", "Amp", "Sigma", "C", "A", "S"])
+            ["", "Assign", "Shape", "Center", "Amp", "Sigma", "C", "A", "S"])
         hh = self.co_init_table.horizontalHeader()
         hh.setDefaultAlignment(Qt.AlignCenter)
         hh.setFixedHeight(38)
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
         hh.setSectionResizeMode(3, QHeaderView.Stretch)
         hh.setSectionResizeMode(4, QHeaderView.Stretch)
-        hh.setSectionResizeMode(5, QHeaderView.Fixed)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
         hh.setSectionResizeMode(6, QHeaderView.Fixed)
         hh.setSectionResizeMode(7, QHeaderView.Fixed)
+        hh.setSectionResizeMode(8, QHeaderView.Fixed)
         self.co_init_table.setColumnWidth(0, 24)
-        self.co_init_table.setColumnWidth(1, 128)
-        self.co_init_table.setColumnWidth(5, 44)
+        self.co_init_table.setColumnWidth(1, 112)
+        self.co_init_table.setColumnWidth(2, 112)
         self.co_init_table.setColumnWidth(6, 44)
         self.co_init_table.setColumnWidth(7, 44)
+        self.co_init_table.setColumnWidth(8, 44)
         self.co_init_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.co_init_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.co_init_table.verticalHeader().setVisible(False)
@@ -665,9 +740,9 @@ class RightPanel(QWidget):
         self.co_init_table.itemChanged.connect(self._on_co_table_changed)
         self.co_init_table.delete_pressed.connect(self._delete_selected_co_peaks)
         lock_tips = {
-            5: "Lock Center",
-            6: "Lock Amplitude",
-            7: "Lock Sigma",
+            6: "Lock Center",
+            7: "Lock Amplitude",
+            8: "Lock Sigma",
         }
         for col, tip in lock_tips.items():
             self.co_init_table.setHorizontalHeaderItem(
@@ -676,7 +751,7 @@ class RightPanel(QWidget):
         co_grp_layout.addWidget(self.co_init_table)
 
         co_btn_row = QHBoxLayout()
-        btn_clear_co_peaks = QPushButton("✕ Clear CO_B Peaks")
+        btn_clear_co_peaks = QPushButton("✕ Clear CO Peaks")
         btn_clear_co_peaks.setObjectName("btn_flat")
         btn_clear_co_peaks.clicked.connect(self._on_clear_co_peaks)
         co_btn_row.addWidget(btn_clear_co_peaks)
@@ -686,12 +761,12 @@ class RightPanel(QWidget):
 
         layout.addWidget(self._co_b_deconv_grp)
 
-        btn_fit_all_co = QPushButton("⚡  Analyze All CO")
+        btn_fit_all_co = QPushButton("⚡  Fit All CO")
         btn_fit_all_co.setObjectName("btn_primary")
         btn_fit_all_co.clicked.connect(self.co_analyze_all_requested.emit)
         layout.addWidget(btn_fit_all_co)
 
-        btn_fit_co = QPushButton("▶  Reanalyze Current")
+        btn_fit_co = QPushButton("▶  Fit Current")
         btn_fit_co.setObjectName("btn_success")
         btn_fit_co.clicked.connect(self.fit_requested.emit)
         layout.addWidget(btn_fit_co)
@@ -701,14 +776,15 @@ class RightPanel(QWidget):
         return w
 
     def _on_co_b_mode_changed(self, mode_text: str):
-        self._co_b_deconv_grp.setVisible(mode_text != "Simple Only")
+        self._co_b_deconv_grp.setVisible(True)
+
+    def set_co_b_fit_mode(self, mode: str):
+        self.combo_co_b_mode.blockSignals(True)
+        self.combo_co_b_mode.setCurrentText("Manual Assignment")
+        self.combo_co_b_mode.blockSignals(False)
+        self._on_co_b_mode_changed("Manual Assignment")
 
     def get_co_b_fit_mode(self) -> str:
-        text = self.combo_co_b_mode.currentText()
-        if text == "Always 2-Peak":
-            return "always_2peak"
-        if text == "Simple Only":
-            return "simple_only"
         return "auto"
 
     def _build_sio_peaks_page(self):
@@ -718,11 +794,10 @@ class RightPanel(QWidget):
         layout.setSpacing(10)
 
         info = QLabel(
-            "Si-O  :  1100 – 1300 cm⁻¹\n"
-            "피크 중심: ~1230 cm⁻¹  (음의 피크)\n\n"
-            "플롯에서 baseline endpoint(점선)를\n"
-            "드래그해 위치를 조정하세요.\n\n"
-            "면적 = |∫(corrected) dν|"
+            "Si-O area는 Analysis Region 범위를 적분합니다.\n"
+            "Baseline은 Total tab에서 잡은 corrected spectrum을 사용합니다.\n"
+            "Total corrected가 없으면 raw data를 그대로 사용합니다.\n\n"
+            "면적 = |∫(analysis input) dν|"
         )
         info.setStyleSheet("color: #a6adc8; font-size: 11px;")
         layout.addWidget(info)
@@ -905,6 +980,14 @@ class RightPanel(QWidget):
             self.spin_wn_min.blockSignals(False)
             self.spin_wn_max.blockSignals(False)
 
+        if hasattr(self, '_baseline_group'):
+            is_total = mode == 'Total'
+            self._baseline_group.setVisible(is_total)
+            self._bl_panel.setVisible(is_total and self.btn_edit_bl.isChecked())
+
+        if hasattr(self, '_region_group'):
+            self._region_group.setVisible(mode != 'CO')
+
         self._sync_summary_visibility()
         self.mode_changed.emit(mode)
 
@@ -918,6 +1001,9 @@ class RightPanel(QWidget):
         self.cb_total_shift.blockSignals(True)
         self.cb_total_shift.setChecked(bool(checked))
         self.cb_total_shift.blockSignals(False)
+
+    def is_total_shift_enabled(self) -> bool:
+        return bool(self.cb_total_shift.isChecked() and self.cb_total_shift.isEnabled())
 
     def set_total_probe_checked(self, checked: bool):
         self.cb_total_probe.blockSignals(True)
@@ -939,7 +1025,23 @@ class RightPanel(QWidget):
         current_max = min(max(self.spin_wn_max.value(), wn_min), wn_max)
         self.spin_wn_min.setValue(current_min)
         self.spin_wn_max.setValue(current_max)
+        if hasattr(self, 'spin_oh_norm_min') and hasattr(self, 'spin_oh_norm_max'):
+            self.spin_oh_norm_min.setRange(wn_min, wn_max)
+            self.spin_oh_norm_max.setRange(wn_min, wn_max)
+            norm_min = min(max(self.spin_oh_norm_min.value(), wn_min), wn_max)
+            norm_max = min(max(self.spin_oh_norm_max.value(), wn_min), wn_max)
+            self.spin_oh_norm_min.setValue(norm_min)
+            self.spin_oh_norm_max.setValue(norm_max)
         self._mode_regions[self._current_mode] = (float(current_min), float(current_max))
+
+    def set_region_values(self, wn_min: float, wn_max: float):
+        self.spin_wn_min.blockSignals(True)
+        self.spin_wn_max.blockSignals(True)
+        self.spin_wn_min.setValue(float(wn_min))
+        self.spin_wn_max.setValue(float(wn_max))
+        self.spin_wn_min.blockSignals(False)
+        self.spin_wn_max.blockSignals(False)
+        self._mode_regions[self._current_mode] = (float(wn_min), float(wn_max))
 
     def get_config(self) -> dict:
         algo = self.combo_bl_algo.currentText()
@@ -954,6 +1056,16 @@ class RightPanel(QWidget):
             'center_tolerance': self.spin_tolerance.value(),
             'baseline_algo': algo,
             'baseline_params': params,
+        }
+
+    def get_oh_overlay_intensity_config(self) -> dict:
+        mode = self.combo_oh_overlay_intensity.currentText().lower()
+        wn_min = float(self.spin_oh_norm_min.value())
+        wn_max = float(self.spin_oh_norm_max.value())
+        return {
+            'mode': 'normalize' if mode == 'normalize' else 'original',
+            'wn_min': min(wn_min, wn_max),
+            'wn_max': max(wn_min, wn_max),
         }
 
     def get_n_peaks(self) -> int:
@@ -989,6 +1101,8 @@ class RightPanel(QWidget):
         self.spin_tolerance.setValue(config.get('center_tolerance', self.spin_tolerance.value()))
 
         algo = config.get('baseline_algo', self.combo_bl_algo.currentText())
+        if algo == 'OH Auto Baseline':
+            algo = 'Manual'
         self.combo_bl_algo.setCurrentText(algo)
         params = config.get('baseline_params', {})
         if 'lam' in params:
@@ -1241,9 +1355,9 @@ class RightPanel(QWidget):
     def get_co_locks(self) -> list:
         locks = []
         for i in range(self.co_init_table.rowCount()):
-            ci = self.co_init_table.item(i, 5)
-            ai = self.co_init_table.item(i, 6)
-            si = self.co_init_table.item(i, 7)
+            ci = self.co_init_table.item(i, 6)
+            ai = self.co_init_table.item(i, 7)
+            si = self.co_init_table.item(i, 8)
             locks.append({
                 'center': ci is not None and ci.checkState() == Qt.Checked,
                 'amplitude': ai is not None and ai.checkState() == Qt.Checked,
@@ -1263,6 +1377,17 @@ class RightPanel(QWidget):
             dot.setForeground(QColor(PEAK_COLORS[i % len(PEAK_COLORS)]))
             dot.setFlags(dot.flags() & ~Qt.ItemIsEditable)
             dot.setTextAlignment(Qt.AlignCenter)
+
+            assign_combo = QComboBox()
+            assign_combo.addItems(CO_ASSIGNMENTS)
+            assignment = getattr(g, 'assignment', 'Unassigned')
+            if assignment not in CO_ASSIGNMENTS:
+                assignment = 'Unassigned'
+            assign_combo.setCurrentText(assignment)
+            assign_combo.setFocusPolicy(Qt.NoFocus)
+            assign_combo.setObjectName("table_combo")
+            assign_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            assign_combo.setMinimumContentsLength(9)
 
             shape_combo = QComboBox()
             shape_combo.addItems(['Gaussian', 'Lorentzian', 'Voigt'])
@@ -1286,13 +1411,15 @@ class RightPanel(QWidget):
                 return item
 
             self.co_init_table.setItem(i, 0, dot)
-            self.co_init_table.setCellWidget(i, 1, shape_combo)
-            self.co_init_table.setItem(i, 2, center_item)
-            self.co_init_table.setItem(i, 3, amp_item)
-            self.co_init_table.setItem(i, 4, sigma_item)
-            self.co_init_table.setItem(i, 5, _chk(old.get('center', False)))
-            self.co_init_table.setItem(i, 6, _chk(old.get('amplitude', False)))
-            self.co_init_table.setItem(i, 7, _chk(old.get('sigma', False)))
+            self.co_init_table.setCellWidget(i, 1, assign_combo)
+            self.co_init_table.setCellWidget(i, 2, shape_combo)
+            self.co_init_table.setItem(i, 3, center_item)
+            self.co_init_table.setItem(i, 4, amp_item)
+            self.co_init_table.setItem(i, 5, sigma_item)
+            self.co_init_table.setItem(i, 6, _chk(old.get('center', False)))
+            self.co_init_table.setItem(i, 7, _chk(old.get('amplitude', False)))
+            self.co_init_table.setItem(i, 8, _chk(old.get('sigma', False)))
+            assign_combo.currentTextChanged.connect(self._on_co_shape_combo_changed)
             shape_combo.currentTextChanged.connect(self._on_co_shape_combo_changed)
         self.co_init_table.blockSignals(False)
 
@@ -1305,13 +1432,17 @@ class RightPanel(QWidget):
         guesses = []
         for i in range(self.co_init_table.rowCount()):
             try:
-                combo = self.co_init_table.cellWidget(i, 1)
-                shape = combo.currentText().lower() if combo else self.get_peak_shape_co()
-                center = float(self.co_init_table.item(i, 2).text())
-                amp = float(self.co_init_table.item(i, 3).text())
-                sigma = float(self.co_init_table.item(i, 4).text())
-                guesses.append(PeakGuess(
-                    center=center, amplitude=amp, sigma=sigma, index=i, shape=shape))
+                assign_combo = self.co_init_table.cellWidget(i, 1)
+                assignment = assign_combo.currentText() if assign_combo else 'Unassigned'
+                shape_combo = self.co_init_table.cellWidget(i, 2)
+                shape = shape_combo.currentText().lower() if shape_combo else self.get_peak_shape_co()
+                center = float(self.co_init_table.item(i, 3).text())
+                amp = float(self.co_init_table.item(i, 4).text())
+                sigma = float(self.co_init_table.item(i, 5).text())
+                guess = PeakGuess(
+                    center=center, amplitude=amp, sigma=sigma, index=i, shape=shape)
+                guess.assignment = assignment
+                guesses.append(guess)
             except (AttributeError, ValueError):
                 pass
         return guesses
@@ -1321,7 +1452,7 @@ class RightPanel(QWidget):
             self._on_co_table_changed(self.co_init_table.item(0, 0))
 
     def _on_co_table_changed(self, item):
-        if item is not None and item.column() >= 5:
+        if item is not None and item.column() >= 6:
             self.co_locks_changed.emit(self.get_co_locks())
             return
         guesses = self.get_co_guesses()
@@ -1356,7 +1487,7 @@ class RightPanel(QWidget):
             self._co_guesses[idx].center = center
         if idx < self.co_init_table.rowCount():
             self.co_init_table.blockSignals(True)
-            item = self.co_init_table.item(idx, 2)
+            item = self.co_init_table.item(idx, 3)
             if item:
                 item.setText(f"{center:.1f}")
             self.co_init_table.blockSignals(False)
@@ -1366,7 +1497,7 @@ class RightPanel(QWidget):
             self._co_guesses[idx].amplitude = amp
         if idx < self.co_init_table.rowCount():
             self.co_init_table.blockSignals(True)
-            item = self.co_init_table.item(idx, 3)
+            item = self.co_init_table.item(idx, 4)
             if item:
                 item.setText(f"{amp:.4f}")
             self.co_init_table.blockSignals(False)
@@ -1376,7 +1507,7 @@ class RightPanel(QWidget):
             self._co_guesses[idx].sigma = sigma
         if idx < self.co_init_table.rowCount():
             self.co_init_table.blockSignals(True)
-            item = self.co_init_table.item(idx, 4)
+            item = self.co_init_table.item(idx, 5)
             if item:
                 item.setText(f"{sigma:.1f}")
             self.co_init_table.blockSignals(False)

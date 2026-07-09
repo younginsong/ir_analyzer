@@ -133,21 +133,39 @@ def auto_co_baseline_endpoints(wavenumber: np.ndarray,
 def baseline_from_points(wavenumber: np.ndarray, absorbance: np.ndarray,
                           points: list[tuple[float, float]]) -> np.ndarray:
     """
-    사용자가 지정한 (wavenumber, absorbance) 포인트들을 cubic spline 보간하여 베이스라인 생성.
-    포인트가 2~3개이면 linear/quadratic으로 자동 강등.
+    사용자가 지정한 (wavenumber, absorbance) 포인트들을 기존 OH 방식으로
+    보간하여 베이스라인 생성. 포인트가 2~3개이면 linear/quadratic으로
+    자동 강등하고, 4개 이상이면 cubic을 사용한다.
     points: [(wn1, abs1), (wn2, abs2), ...]
     """
+    wn = np.asarray(wavenumber, dtype=float)
+    ab = np.asarray(absorbance, dtype=float)
     if len(points) < 2:
-        return np.zeros_like(absorbance)
+        return np.zeros_like(ab)
 
-    pts = sorted(points, key=lambda x: x[0])
-    wn_pts = np.array([p[0] for p in pts])
-    ab_pts = np.array([p[1] for p in pts])
+    # Old sessions can contain duplicate anchors. Keep the last value at each
+    # wavenumber so the interpolator always receives a strictly increasing x.
+    unique = {}
+    for point in points:
+        if not isinstance(point, (tuple, list)) or len(point) < 2:
+            continue
+        x, y = float(point[0]), float(point[1])
+        if np.isfinite(x) and np.isfinite(y):
+            unique[x] = y
+    if len(unique) < 2:
+        return np.zeros_like(ab)
 
-    n = len(pts)
+    wn_pts = np.array(sorted(unique), dtype=float)
+    ab_pts = np.array([unique[x] for x in wn_pts], dtype=float)
+    n = len(wn_pts)
     kind = 'cubic' if n >= 4 else ('quadratic' if n == 3 else 'linear')
-    f = interp1d(wn_pts, ab_pts, kind=kind, fill_value='extrapolate')
-    return f(wavenumber)
+    interpolator = interp1d(
+        wn_pts,
+        ab_pts,
+        kind=kind,
+        fill_value='extrapolate',
+    )
+    return np.asarray(interpolator(wn), dtype=float)
 
 
 def baseline_rubberband(wavenumber: np.ndarray, absorbance: np.ndarray) -> np.ndarray:
@@ -201,7 +219,8 @@ def baseline_arpls(absorbance: np.ndarray,
         s = dn.std()
         if s < 1e-10:
             break
-        w_new = 1.0 / (1.0 + np.exp(2.0 * (d - (2.0 * s - m)) / s))
+        exponent = np.clip(2.0 * (d - (2.0 * s - m)) / s, -700.0, 700.0)
+        w_new = 1.0 / (1.0 + np.exp(exponent))
         if np.linalg.norm(w_new - w) / np.linalg.norm(w) < ratio:
             break
         w = w_new

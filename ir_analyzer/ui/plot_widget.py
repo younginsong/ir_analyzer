@@ -20,7 +20,7 @@ from core.fitter import build_model
 from lmfit import Parameters
 
 COLORS = {
-    'raw':       '#45475a',
+    'raw':       '#9399b2',
     'baseline':  '#6c7086',
     'corrected': '#cdd6f4',
     'fitted':    '#f38ba8',
@@ -64,6 +64,7 @@ class PlotWidget(QWidget):
     total_shift_changed    = pyqtSignal(str, float)      # (spectrum name, y shift)
     total_shift_mode_changed = pyqtSignal(bool)
     total_probe_mode_changed = pyqtSignal(bool)
+    total_region_toggled   = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -90,6 +91,9 @@ class PlotWidget(QWidget):
         self._total_shift_enabled = False
         self._total_probe_enabled = False
         self._total_drag = None
+        self._total_region_drag = None
+        self._total_region_preview = None
+        self._total_inactive_region_items = []
         self._coord_text = None
         self._coord_vline = None
         self._coord_hline = None
@@ -265,8 +269,39 @@ class PlotWidget(QWidget):
                                 name='Corrected')
             self._items['corrected'] = item
 
+    def set_baseline_curve(self, wn, baseline):
+        if 'baseline' in self._items:
+            self._items['baseline'].setData(wn, baseline)
+        else:
+            item = self.pw.plot(
+                wn,
+                baseline,
+                pen=pg.mkPen(COLORS['baseline'], width=1, style=Qt.DashLine),
+                name='Baseline',
+            )
+            item.setVisible(self.cb_baseline.isChecked())
+            item.setZValue(7)
+            self._items['baseline'] = item
+
+    def set_total_edit_raw_curve(self, wn, raw):
+        if 'raw' in self._items:
+            self._items['raw'].setData(wn, raw)
+        else:
+            color = QColor(COLORS['raw'])
+            color.setAlpha(230)
+            item = self.pw.plot(
+                wn,
+                raw,
+                pen=pg.mkPen(color, width=1.6),
+                name='Raw',
+            )
+            item.setVisible(self.cb_raw.isChecked())
+            item.setZValue(5)
+            self._items['raw'] = item
+
     def show_highlighted_region(self, wn, ab):
         """분석 구간만 흰색으로 강조 표시한다."""
+        self._wn_crop = np.asarray(wn, dtype=float)
         if 'corrected' in self._items:
             self._items['corrected'].setData(wn, ab)
         else:
@@ -348,6 +383,53 @@ class PlotWidget(QWidget):
             item.setPen(pg.mkPen(qcolor, width=2.2 if is_active else 1.25))
             item.setZValue(6 if is_active else 3)
         return True
+
+    def set_total_inactive_ranges(self, ranges: list[tuple[float, float]]):
+        for item in self._total_inactive_region_items:
+            try:
+                self.pw.removeItem(item)
+            except Exception:
+                pass
+        self._total_inactive_region_items.clear()
+
+        if not self._total_mode:
+            return
+
+        for start, end in ranges:
+            lo, hi = sorted((float(start), float(end)))
+            region = pg.LinearRegionItem(
+                values=(lo, hi),
+                movable=False,
+                brush=pg.mkBrush(243, 139, 168, 38),
+                pen=pg.mkPen('#f38ba8', width=1, style=Qt.DashLine),
+            )
+            region.setZValue(1)
+            self.pw.addItem(region)
+            self._total_inactive_region_items.append(region)
+
+    def _update_total_region_preview(self, x_value: float):
+        if self._total_region_drag is None:
+            return
+        start_x = float(self._total_region_drag['start_x'])
+        if self._total_region_preview is None:
+            self._total_region_preview = pg.LinearRegionItem(
+                values=(start_x, float(x_value)),
+                movable=False,
+                brush=pg.mkBrush(249, 226, 175, 45),
+                pen=pg.mkPen('#f9e2af', width=1),
+            )
+            self._total_region_preview.setZValue(30)
+            self.pw.addItem(self._total_region_preview)
+        else:
+            self._total_region_preview.setRegion((start_x, float(x_value)))
+
+    def _clear_total_region_preview(self):
+        if self._total_region_preview is not None:
+            try:
+                self.pw.removeItem(self._total_region_preview)
+            except Exception:
+                pass
+            self._total_region_preview = None
 
     def set_total_shift_mode(self, enabled: bool):
         self._total_shift_enabled = bool(enabled)
@@ -505,14 +587,15 @@ class PlotWidget(QWidget):
     def restore_baseline_points(self, points: list):
         """저장된 베이스라인 포인트 마커를 플롯에 복원."""
         self.clear_baseline_points()
-        visible = self.cb_baseline.isChecked()
+        visible = self._baseline_mode or self.cb_baseline.isChecked()
         for wn, ab in points:
             scatter = pg.ScatterPlotItem(
                 x=[wn], y=[ab],
-                symbol='o', size=8,
+                symbol='o', size=10,
                 brush=pg.mkBrush(COLORS['baseline']),
-                pen=pg.mkPen('#1e1e2e', width=1)
+                pen=pg.mkPen('#f8f8ff', width=1.2)
             )
+            scatter.setZValue(80)
             scatter.setVisible(visible)
             self.pw.addItem(scatter)
             self._bl_scatter_items.append(scatter)
@@ -1081,8 +1164,15 @@ class PlotWidget(QWidget):
             pt = to_data(event.pos())
 
             if self._total_mode:
+                if self._baseline_mode:
+                    return False
                 if event.button() == Qt.RightButton:
-                    self._show_total_context_menu(event.globalPos())
+                    self._total_region_drag = {
+                        'start_x': float(pt.x()),
+                        'start_px': int(event.pos().x()),
+                        'start_py': int(event.pos().y()),
+                    }
+                    self.pw.setCursor(Qt.CrossCursor)
                     return True
                 if event.button() == Qt.LeftButton and self._total_shift_enabled:
                     spec = self._hit_test_total_spectrum(pt)
@@ -1133,6 +1223,15 @@ class PlotWidget(QWidget):
 
             if self._total_mode:
                 self._update_total_probe(pt)
+                if (
+                    self._total_region_drag is not None
+                    and (event.buttons() & Qt.RightButton)
+                ):
+                    dx = int(event.pos().x()) - self._total_region_drag['start_px']
+                    dy = int(event.pos().y()) - self._total_region_drag['start_py']
+                    if dx * dx + dy * dy >= 16:
+                        self._update_total_region_preview(pt.x())
+                    return True
                 if self._total_drag is not None and (event.buttons() & Qt.LeftButton):
                     dy = float(pt.y()) - self._total_drag['start_y']
                     self._update_total_shift(
@@ -1153,6 +1252,21 @@ class PlotWidget(QWidget):
 
         # ── 마우스 버튼 뗌 ──
         elif t == QEvent.MouseButtonRelease:
+            if self._total_region_drag is not None and event.button() == Qt.RightButton:
+                pt = to_data(event.pos())
+                dx = int(event.pos().x()) - self._total_region_drag['start_px']
+                dy = int(event.pos().y()) - self._total_region_drag['start_py']
+                start_x = float(self._total_region_drag['start_x'])
+                self._total_region_drag = None
+                self._clear_total_region_preview()
+                self.pw.setCursor(Qt.CrossCursor if self._total_probe_enabled else (
+                    Qt.OpenHandCursor if self._total_shift_enabled else Qt.ArrowCursor))
+                if dx * dx + dy * dy >= 16 and abs(float(pt.x()) - start_x) > 1e-9:
+                    self.total_region_toggled.emit(start_x, float(pt.x()))
+                else:
+                    self._show_total_context_menu(event.globalPos())
+                return True
+
             if self._total_drag is not None and event.button() == Qt.LeftButton:
                 self._total_drag = None
                 self.pw.setCursor(Qt.OpenHandCursor if self._total_shift_enabled else (
@@ -1453,7 +1567,8 @@ class PlotWidget(QWidget):
             if draw_baseline:
                 self._draw_ep_baseline(sub, ep0, ep1, color)
 
-    def show_sio_baseline(self, wn, ab, endpoints=(1100.0, 1300.0)):
+    def show_sio_baseline(self, wn, ab, endpoints=(1100.0, 1300.0),
+                          draw_baseline: bool = True):
         self._ep_ref_wn = wn
         self._ep_ref_ab = ab
         self.clear_endpoint_items()
@@ -1473,9 +1588,10 @@ class PlotWidget(QWidget):
 
             def _make_sio_handler(sd):
                 def _on_change(l):
-                    eps = [self._ep_lines['SiO_0'].value(),
-                           self._ep_lines['SiO_1'].value()]
-                    self._draw_ep_baseline('SiO', eps[0], eps[1], color)
+                    if draw_baseline:
+                        eps = [self._ep_lines['SiO_0'].value(),
+                               self._ep_lines['SiO_1'].value()]
+                        self._draw_ep_baseline('SiO', eps[0], eps[1], color)
                 def _on_done(l):
                     _on_change(l)
                     self.sio_endpoint_moved.emit(sd, l.value())
@@ -1487,7 +1603,12 @@ class PlotWidget(QWidget):
             self.pw.addItem(line)
             self._ep_lines[key] = line
 
-        self._draw_ep_baseline('SiO', endpoints[0], endpoints[1], color)
+        if draw_baseline:
+            self._draw_ep_baseline('SiO', endpoints[0], endpoints[1], color)
+
+    def show_sio_region_handles(self, wn, ab, endpoints=(1100.0, 1300.0)):
+        """Show draggable Si-O integration-region handles without a baseline line."""
+        self.show_sio_baseline(wn, ab, endpoints=endpoints, draw_baseline=False)
 
     def get_co_endpoints(self) -> dict:
         result = {}
@@ -1521,7 +1642,8 @@ class PlotWidget(QWidget):
                 self._ep_lines[key].blockSignals(True)
                 self._ep_lines[key].setValue(val)
                 self._ep_lines[key].blockSignals(False)
-        self._draw_ep_baseline('SiO', ep0, ep1, '#cba6f7')
+        if 'bl_SiO' in self._items:
+            self._draw_ep_baseline('SiO', ep0, ep1, '#cba6f7')
 
     def show_analysis_region(self, wn_pairs: list, color: str = '#cdd6f4'):
         self.clear_analysis_region()
@@ -1762,6 +1884,9 @@ class PlotWidget(QWidget):
         self._total_specs.clear()
         self._total_items.clear()
         self._total_drag = None
+        self._total_region_drag = None
+        self._total_region_preview = None
+        self._total_inactive_region_items.clear()
         if hasattr(self, '_coord_label'):
             self._coord_label.setVisible(False)
             self._coord_label.setText("")

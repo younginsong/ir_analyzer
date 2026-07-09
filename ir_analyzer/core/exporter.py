@@ -14,7 +14,6 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import LineChart, Reference
 from openpyxl.utils.dataframe import dataframe_to_rows
 from core.fitter import FitResult
-from core.baseline import auto_co_baseline_endpoints
 
 
 # 컬러 팔레트
@@ -109,8 +108,9 @@ def _append_oh_processed_sheet(wb, entries, potentials: dict, spectrum_states: d
     return rows_written
 
 
-def _append_co_processed_sheet(wb, entries, potentials: dict, co_states: dict) -> int:
-    """CO_L / CO_B endpoint baseline 기반 corrected 스펙트럼을 저장."""
+def _append_co_processed_sheet(wb, entries, potentials: dict,
+                               spectrum_states: dict) -> int:
+    """CO fixed regions에서 Total-corrected 또는 raw 분석 입력을 저장."""
     if not entries:
         return 0
 
@@ -122,10 +122,10 @@ def _append_co_processed_sheet(wb, entries, potentials: dict, co_states: dict) -
         "Wavenumber (cm⁻¹)",
         "Raw",
         "Baseline",
-        "Corrected",
-        "Endpoint 0 (cm⁻¹)",
-        "Endpoint 1 (cm⁻¹)",
-        "Endpoint Source",
+        "Analysis Input",
+        "Region Min (cm⁻¹)",
+        "Region Max (cm⁻¹)",
+        "Input Source",
         "Source File",
     ]
     ws.append(headers)
@@ -134,35 +134,42 @@ def _append_co_processed_sheet(wb, entries, potentials: dict, co_states: dict) -
 
     rows_written = 0
     for entry in entries:
-        entry_state = co_states.get(entry.filepath, {})
         potential = potentials.get(entry.name)
         wn_full = np.asarray(entry.wavenumber)
         ab_full = np.asarray(entry.absorbance)
-        auto_eps = auto_co_baseline_endpoints(wn_full, ab_full)
+        state = spectrum_states.get(entry.filepath, {})
+        state_wn = np.asarray(state.get('wn_crop', []))
+        state_raw = np.asarray(state.get('ab_crop', []))
+        state_baseline = np.asarray(state.get('baseline', []))
+        state_corrected = np.asarray(state.get('ab_corrected', []))
 
-        for region in ('CO_L', 'CO_B'):
-            region_state = entry_state.get(region)
-            ep0 = region_state.get('ep0') if region_state else None
-            ep1 = region_state.get('ep1') if region_state else None
-            endpoint_source = "saved"
-            if ep0 is None or ep1 is None:
-                ep0, ep1 = auto_eps.get(
-                    region,
-                    (2000.0, 2100.0) if region == 'CO_L' else (1650.0, 1900.0),
-                )
-                endpoint_source = "auto"
-
-            lo, hi = sorted((float(ep0), float(ep1)))
-            mask = (wn_full >= lo) & (wn_full <= hi)
-            if not np.any(mask):
-                continue
-
-            wn = wn_full[mask]
-            ab = ab_full[mask]
-            y0 = float(np.interp(lo, wn_full, ab_full))
-            y1 = float(np.interp(hi, wn_full, ab_full))
-            baseline = np.interp(wn, [lo, hi], [y0, y1])
-            corrected = ab - baseline
+        for region, (lo, hi) in {
+            'CO_L': (2000.0, 2100.0),
+            'CO_B': (1650.0, 1900.0),
+        }.items():
+            state_mask = (state_wn >= lo) & (state_wn <= hi)
+            state_ready = (
+                len(state_wn) > 0
+                and len(state_raw) == len(state_wn)
+                and len(state_baseline) == len(state_wn)
+                and len(state_corrected) == len(state_wn)
+                and np.any(state_mask)
+            )
+            if state_ready:
+                wn = state_wn[state_mask]
+                ab = state_raw[state_mask]
+                baseline = state_baseline[state_mask]
+                corrected = state_corrected[state_mask]
+                input_source = "Total corrected"
+            else:
+                mask = (wn_full >= lo) & (wn_full <= hi)
+                if not np.any(mask):
+                    continue
+                wn = wn_full[mask]
+                ab = ab_full[mask]
+                baseline = np.zeros_like(ab)
+                corrected = ab.copy()
+                input_source = "Raw"
 
             for idx in range(len(wn)):
                 ws.append([
@@ -175,7 +182,7 @@ def _append_co_processed_sheet(wb, entries, potentials: dict, co_states: dict) -
                     round(float(corrected[idx]), 6),
                     round(lo, 4),
                     round(hi, 4),
-                    endpoint_source,
+                    input_source,
                     entry.source_spectrum_path or entry.filepath,
                 ])
                 rows_written += 1
@@ -193,7 +200,7 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
     - Index 시트: 스펙트럼 메타데이터
     - Raw Matrix / Raw Spectra: 원본 스펙트럼
     - OH Processed: OH baseline / corrected
-    - CO Processed: CO endpoint baseline / corrected
+    - CO Processed: CO 분석에 사용되는 Total corrected 또는 raw 입력
     """
     if not entries:
         raise ValueError("내보낼 스펙트럼이 없습니다.")
@@ -280,7 +287,8 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
         _autosize_columns(ws_raw, sample_row_limit=20, min_width=14)
 
     oh_points = _append_oh_processed_sheet(wb, entries, potentials, spectrum_states or {})
-    co_points = _append_co_processed_sheet(wb, entries, potentials, co_states or {})
+    co_points = _append_co_processed_sheet(
+        wb, entries, potentials, spectrum_states or {})
 
     _autosize_columns(ws_idx, sample_row_limit=20, min_width=14)
     wb.save(filepath)
@@ -555,7 +563,7 @@ def export_co_results(co_fit_records: list, co_states: dict,
     """
     CO 분석 결과 Excel 저장.
     - CO Summary 시트: 전위별 CO_L/CO_B center, area, ratio
-    - CO_B deconvolution 시트 (deconv 사용 시): wn, corrected, fitted, 개별 피크 곡선
+    - CO deconvolution 시트 (manual fit 사용 시): wn, corrected, fitted, 개별 피크 곡선
     """
     entry_map = {e.name: e for e in (entries or [])}
 
@@ -628,25 +636,35 @@ def export_co_results(co_fit_records: list, co_states: dict,
             for pot, ctr in zip(sr.potentials, sr.centers):
                 ws_sum.append([round(pot, 4), round(ctr, 4)])
 
-    # ── CO_B deconvolution 시트 (per spectrum) ────────────────
+    # ── CO manual deconvolution 시트 (per spectrum) ───────────
     for record in co_fit_records:
         fname  = record['filename']
         entry  = entry_map.get(fname)
         if entry is None:
             continue
 
-        co_b_state = co_states.get(entry.filepath, {}).get('CO_B', {})
-        raw_fit  = co_b_state.get('raw_fit_result')
-        wn_b     = co_b_state.get('wn_b')
-        ab_pos_b = co_b_state.get('ab_pos_b')
+        entry_state = co_states.get(entry.filepath, {})
+        manual_state = entry_state.get('manual_fit', {})
+        if not manual_state:
+            manual_state = entry_state.get('CO_B', {})
+        raw_fit = (
+            manual_state.get('fit_result')
+            or manual_state.get('raw_fit_result')
+        )
+        wn_b = manual_state.get('wn')
+        if wn_b is None:
+            wn_b = manual_state.get('wn_b')
+        ab_pos_b = manual_state.get('ab')
+        if ab_pos_b is None:
+            ab_pos_b = manual_state.get('ab_pos_b')
 
         if raw_fit is None or not raw_fit.success or wn_b is None or ab_pos_b is None:
             continue
-        if len(raw_fit.peaks) < 2:
+        if len(raw_fit.peaks) < 1:
             continue
 
         cleaned_stem = re.sub(r'[\\/*?:\[\]]', '_', Path(fname).stem)[:22]
-        sheet_name = f"CO_B_{cleaned_stem}"
+        sheet_name = f"CO_Fit_{cleaned_stem}"
         existing = {ws.title for ws in wb.worksheets}
         base, n = sheet_name, 1
         while sheet_name in existing:
@@ -659,27 +677,24 @@ def export_co_results(co_fit_records: list, co_states: dict,
         if pot is not None:
             ws['B1'] = f"Potential: {pot:.3f} V"
 
-        # CO_B = 높은 파수 피크, 나머지 = OH bending
-        co_b_i = max(range(len(raw_fit.peaks)), key=lambda i: raw_fit.peaks[i].center)
-        oh_b_i = 1 - co_b_i
-
-        data_hdrs = [
-            "Wavenumber (cm⁻¹)", "Corrected", "Fitted Total",
-            f"CO_B ({raw_fit.peaks[co_b_i].center:.0f} cm⁻¹)",
-            f"OH bending ({raw_fit.peaks[oh_b_i].center:.0f} cm⁻¹)",
-        ]
+        assignments = list(manual_state.get('assignments') or [])
+        data_hdrs = ["Wavenumber (cm⁻¹)", "Corrected", "Fitted Total"]
+        for i, peak in enumerate(raw_fit.peaks):
+            label = assignments[i] if i < len(assignments) else "Unassigned"
+            data_hdrs.append(f"P{i + 1} {label} ({peak.center:.0f} cm⁻¹)")
         ws.append([])
         ws.append(data_hdrs)
         _style_header(ws, ws.max_row, len(data_hdrs))
 
         for j in range(len(wn_b)):
-            ws.append([
+            row = [
                 round(wn_b[j], 4),
                 round(ab_pos_b[j], 6),
                 round(raw_fit.fitted_curve[j], 6),
-                round(raw_fit.individual_curves[co_b_i][j], 6),
-                round(raw_fit.individual_curves[oh_b_i][j], 6),
-            ])
+            ]
+            for curve in raw_fit.individual_curves:
+                row.append(round(curve[j], 6))
+            ws.append(row)
 
         _autosize_columns(ws, sample_row_limit=5, min_width=12)
 

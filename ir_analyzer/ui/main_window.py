@@ -28,8 +28,7 @@ from ui.analysis_widget  import AnalysisWidget
 from core.loader      import load_spectrum, crop_region
 from core.baseline    import (baseline_rubberband, baseline_from_points,
                                baseline_arpls, baseline_snip, baseline_linear,
-                               subtract_baseline, auto_oh_baseline_points,
-                               auto_co_baseline_endpoints)
+                               subtract_baseline)
 from core.peak_finder import PeakGuess, find_peaks_second_derivative
 from core.fitter      import fit_peaks, FitResult
 from core.exporter    import (export_single, export_batch, export_all_spectra,
@@ -46,6 +45,12 @@ MAX_OH_SNAPSHOTS = 5
 SETTINGS_ORG = "KIST"
 SETTINGS_APP = "In Situ IR Analyzer"
 SESSION_DIR_KEY = "paths/session_dir"
+CO_ANALYSIS_REGIONS = {
+    'CO_L': (2000.0, 2100.0),
+    'CO_B': (1650.0, 1900.0),
+}
+CO_DISPLAY_REGION = (1400.0, 2230.0)
+CO_ASSIGNMENT_TARGETS = ('CO_L', 'CO_B')
 
 
 @_dc
@@ -159,6 +164,7 @@ class MainWindow(QMainWindow):
         self.batch_results    = []
         self._fit_records: list = []
         self._spectrum_states: dict = {}   # {filepath: OH state dict}
+        self._total_baseline_states: dict = {}  # {filepath: Total baseline/corrected state}
         self._co_states:  dict = {}        # {filepath: {'CO_L': state, 'CO_B': state}}
         self._sio_states: dict = {}        # {filepath: {'ep0', 'ep1'}} — endpoints only
         self._co_fit_records: list = []    # [{filename, CO_L: FitResult, CO_B: FitResult}]
@@ -169,6 +175,7 @@ class MainWindow(QMainWindow):
         self._fit_edit_pending: bool = False
         self._total_shifts: dict[str, dict[str, float]] = {}
         self._total_view_mode: str = 'overlay'
+        self._total_inactive_ranges: dict[str, list[tuple[float, float]]] = {}
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         # Split view 상태
@@ -289,11 +296,14 @@ class MainWindow(QMainWindow):
 
         # ③ 우측 — 컨트롤 패널
         self.right_panel = RightPanel()
+        self.plot_widget.cb_baseline.setVisible(False)
         self.right_panel.region_changed.connect(self._on_region_changed)
         self.right_panel.baseline_mode_toggled.connect(self._on_bl_mode_toggled)
         self.right_panel.baseline_apply.connect(self._on_bl_apply)
         self.right_panel.baseline_undo.connect(self._on_bl_undo)
         self.right_panel.baseline_clear.connect(self._on_bl_clear)
+        self.right_panel.baseline_point_mode_changed.connect(
+            self._on_baseline_point_mode_changed)
         self.right_panel.fit_requested.connect(self._run_fit)
         self.right_panel.auto_detect_requested.connect(self._auto_detect)
         self.right_panel.peak_params_changed.connect(self._on_peak_params_changed)
@@ -304,6 +314,8 @@ class MainWindow(QMainWindow):
         self.right_panel.co_peak_rows_deleted.connect(self._on_co_peak_rows_deleted)
         self.right_panel.co_peaks_cleared.connect(self._on_co_peaks_cleared)
         self.right_panel.co_locks_changed.connect(self._on_co_peak_locks_changed)
+        self.right_panel.co_peak_add_mode_toggled.connect(
+            self._on_co_peak_add_mode_toggled)
         self.right_panel.plot_auto_range.connect(self.plot_widget.do_auto_range)
         self.right_panel.plot_export.connect(self._export_plot_image)
         self.right_panel.plot_x_auto.connect(self.plot_widget.set_x_auto_range)
@@ -320,9 +332,10 @@ class MainWindow(QMainWindow):
         self.right_panel.auto_detect_co_b_requested.connect(self._auto_detect_co_b)
         self.right_panel.co_analyze_all_requested.connect(self._analyze_all_co)
         self.right_panel.total_view_changed.connect(self._on_total_view_changed)
-        self.right_panel.total_shift_toggled.connect(self.plot_widget.set_total_shift_mode)
+        self.right_panel.total_shift_toggled.connect(self._on_total_shift_toggled)
         self.right_panel.total_probe_toggled.connect(self.plot_widget.set_total_probe_mode)
         self.right_panel.total_reset_shifts.connect(self._reset_total_shifts)
+        self.right_panel.oh_overlay_intensity_changed.connect(self._on_oh_overlay_intensity_changed)
         self.spectrum_list.potential_assignments_changed.connect(self._on_potential_assignments_changed)
         self.spectrum_list.session_filter_changed.connect(self._on_session_filter_changed)
         self.spectrum_list.workspace_created.connect(self._on_workspace_created)
@@ -330,12 +343,13 @@ class MainWindow(QMainWindow):
         self.spectrum_list.session_close_requested.connect(self._close_session_key)
         self.plot_widget.peak_sigma_changed.connect(self._on_peak_sigma_changed)
         self.plot_widget.peak_amplitude_dragged.connect(self._on_peak_amplitude_dragged)
-        self.plot_widget.co_endpoint_moved.connect(self._on_co_endpoint_moved)
         self.plot_widget.sio_endpoint_moved.connect(self._on_sio_endpoint_moved)
         self.plot_widget.total_spectrum_selected.connect(self._on_total_spectrum_selected)
         self.plot_widget.total_shift_changed.connect(self._on_total_shift_changed)
         self.plot_widget.total_shift_mode_changed.connect(self.right_panel.set_total_shift_checked)
+        self.plot_widget.total_shift_mode_changed.connect(self._on_total_shift_toggled)
         self.plot_widget.total_probe_mode_changed.connect(self.right_panel.set_total_probe_checked)
+        self.plot_widget.total_region_toggled.connect(self._on_total_region_toggled)
 
         self.main_splitter.addWidget(self.spectrum_list)
         self.main_splitter.addWidget(self.center_tabs)
@@ -409,6 +423,79 @@ class MainWindow(QMainWindow):
             n += 1
         keys_in_use.add(candidate)
         return candidate
+
+    def _saved_session_key_for_spectrum(self, spectrum: dict) -> str:
+        saved_key = spectrum.get('session_key')
+        if saved_key:
+            return str(saved_key)
+        label = str(spectrum.get('source_session_label') or '').strip()
+        return label if label else self.spectrum_list.LOOSE_FILES_KEY
+
+    def _session_key_for_import_label(self, label: str) -> str:
+        label = str(label or '').strip()
+        return label if label else self.spectrum_list.LOOSE_FILES_KEY
+
+    def _workspace_session_meta(self, data: dict, spectra_data: list[dict]) -> list[dict]:
+        raw_meta = data.get('workspace_sessions')
+        meta_by_key = {}
+        ordered_keys = []
+        if isinstance(raw_meta, (list, tuple)):
+            for item in raw_meta:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get('key') or '').strip()
+                if not key:
+                    continue
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                meta_by_key[key] = {
+                    'key': key,
+                    'label': str(item.get('label') or '').strip(),
+                }
+
+        for spectrum in spectra_data:
+            key = self._saved_session_key_for_spectrum(spectrum)
+            if key not in ordered_keys:
+                ordered_keys.append(key)
+            if key not in meta_by_key:
+                label = str(spectrum.get('source_session_label') or '').strip()
+                if key == self.spectrum_list.LOOSE_FILES_KEY:
+                    label = ""
+                meta_by_key[key] = {'key': key, 'label': label}
+
+        return [meta_by_key[key] for key in ordered_keys if key in meta_by_key]
+
+    def _session_import_label_map(self, data: dict, session_path: str,
+                                  spectra_data: list[dict]) -> tuple[dict[str, str], bool]:
+        session_meta = self._workspace_session_meta(data, spectra_data)
+        used_keys = {self._saved_session_key_for_spectrum(s) for s in spectra_data}
+        session_meta = [meta for meta in session_meta if meta['key'] in used_keys]
+        is_workspace = bool(data.get('workspace_sessions')) and len(session_meta) > 1
+        if not is_workspace:
+            distinct = {
+                self._saved_session_key_for_spectrum(s)
+                for s in spectra_data
+            }
+            is_workspace = len(distinct) > 1
+
+        existing_labels = self._session_labels_in_use()
+        fallback_label = Path(session_path).stem
+        if not is_workspace:
+            mapped_label = self._make_unique_session_label(fallback_label, existing_labels)
+            return {
+                self._saved_session_key_for_spectrum(s): mapped_label
+                for s in spectra_data
+            }, False
+
+        label_map = {}
+        for meta in session_meta:
+            key = meta['key']
+            if key == self.spectrum_list.LOOSE_FILES_KEY:
+                label_map[key] = ""
+                continue
+            base_label = meta.get('label') or key
+            label_map[key] = self._make_unique_session_label(base_label, existing_labels)
+        return label_map, True
 
     def _refresh_after_session_merge(self):
         self._refresh_analysis_for_visible_session()
@@ -522,11 +609,224 @@ class MainWindow(QMainWindow):
         hue = 0.58 * (1.0 - t)
         return QColor.fromHsvF(hue, 0.62, 0.95).name()
 
+    def _selected_total_entries(self) -> list[SpectrumEntry]:
+        entries = self.spectrum_list.get_selected_entries()
+        if entries:
+            return entries
+        if self._current_entry is not None:
+            return [self._current_entry]
+        visible = self._visible_entries()
+        return visible[:1]
+
+    def _analysis_arrays_for_entry(self, entry: SpectrumEntry,
+                                   wn_min: float, wn_max: float):
+        """Return Total-corrected data when available, otherwise unmodified raw data."""
+        state = self._total_baseline_states.get(entry.filepath, {})
+        state_wn = state.get('wn')
+        state_corrected = state.get('corrected')
+        if state_wn is not None and state_corrected is not None:
+            wn = np.asarray(state_wn, dtype=float)
+            corrected = np.asarray(state_corrected, dtype=float)
+            n = min(len(wn), len(corrected))
+            if n:
+                wn = wn[:n]
+                corrected = corrected[:n]
+                raw = np.asarray(state.get('raw', []), dtype=float)
+                baseline = np.asarray(state.get('baseline', []), dtype=float)
+                if len(raw) != n:
+                    order = np.argsort(entry.wavenumber)
+                    raw = np.interp(
+                        wn,
+                        np.asarray(entry.wavenumber, dtype=float)[order],
+                        np.asarray(entry.absorbance, dtype=float)[order],
+                    )
+                else:
+                    raw = raw[:n]
+                if len(baseline) != n:
+                    baseline = raw - corrected
+                else:
+                    baseline = baseline[:n]
+
+                lo, hi = sorted((float(wn_min), float(wn_max)))
+                mask = (wn >= lo) & (wn <= hi)
+                if np.any(mask):
+                    return (
+                        wn[mask].copy(),
+                        raw[mask].copy(),
+                        baseline[mask].copy(),
+                        corrected[mask].copy(),
+                        'total',
+                    )
+
+        wn, raw = crop_region(
+            entry.wavenumber, entry.absorbance, wn_min, wn_max)
+        return (
+            wn.copy(),
+            raw.copy(),
+            np.zeros_like(raw),
+            raw.copy(),
+            'raw',
+        )
+
+    def _prepare_oh_analysis_input(self, entry: SpectrumEntry):
+        cfg = self.right_panel.get_config()
+        wn, raw, baseline, corrected, source = self._analysis_arrays_for_entry(
+            entry, cfg['wn_min'], cfg['wn_max'])
+        self._wn_crop = wn
+        self._ab_crop = raw
+        self._baseline = baseline
+        self._ab_corrected = corrected
+        self._baseline_points = []
+        self.plot_widget.show_highlighted_region(wn, corrected)
+        self._refresh_selected_overlays(self._capture_plot_view())
+        if len(wn):
+            total_oh = abs(float(_trapezoid(corrected, wn)))
+            self.right_panel.update_oh_total_area(
+                total_oh, self._get_sio_area_for_entry(entry))
+        return source
+
+    def _total_display_data_for_entry(self, entry: SpectrumEntry):
+        state = self._total_baseline_states.get(entry.filepath)
+        if state is not None:
+            wn = state.get('wn')
+            corrected = state.get('corrected')
+            if wn is not None and corrected is not None:
+                return np.asarray(wn, dtype=float), np.asarray(corrected, dtype=float)
+        return np.asarray(entry.wavenumber, dtype=float), np.asarray(entry.absorbance, dtype=float)
+
+    def _normalize_total_display(self, wn, ab):
+        return self._normalize_total_values(wn, ab, ab)
+
+    def _total_normalization_range_mask(self, wn):
+        cfg = self.right_panel.get_oh_overlay_intensity_config()
+        wn_arr = np.asarray(wn, dtype=float)
+        return (wn_arr >= cfg['wn_min']) & (wn_arr <= cfg['wn_max'])
+
+    def _total_normalization_offset(self, wn, reference_ab) -> float:
+        active_ab = self._mask_total_inactive_ranges(wn, reference_ab)
+        mask = self._total_normalization_range_mask(wn)
+        n = min(len(mask), len(active_ab))
+        if n == 0:
+            return 0.0
+        finite = np.asarray(active_ab[:n], dtype=float)[mask[:n]]
+        finite = finite[np.isfinite(finite)]
+        if len(finite) == 0:
+            return 0.0
+        return float(np.min(finite))
+
+    def _total_normalization_divisor(self, wn, reference_ab, offset: float = 0.0) -> float:
+        active_ab = self._mask_total_inactive_ranges(
+            wn, np.asarray(reference_ab, dtype=float) - float(offset))
+        max_value = self._max_in_wavenumber_range(
+            wn,
+            active_ab,
+            self.right_panel.get_oh_overlay_intensity_config()['wn_min'],
+            self.right_panel.get_oh_overlay_intensity_config()['wn_max'],
+        )
+        if max_value is None or abs(max_value) <= 1e-12:
+            return 1.0
+        return max_value
+
+    def _normalize_total_values(self, wn, values, reference_ab):
+        cfg = self.right_panel.get_oh_overlay_intensity_config()
+        if cfg['mode'] != 'normalize':
+            return values
+        offset = self._total_normalization_offset(wn, reference_ab)
+        divisor = self._total_normalization_divisor(wn, reference_ab, offset)
+        return (np.asarray(values, dtype=float) - offset) / divisor
+
+    def _total_state_has_effective_baseline(self, entry: SpectrumEntry) -> bool:
+        state = self._total_baseline_states.get(entry.filepath, {})
+        if len(state.get('points', [])) >= 2:
+            return True
+        baseline = np.asarray(state.get('baseline', []), dtype=float)
+        finite = baseline[np.isfinite(baseline)]
+        return bool(len(finite) and np.any(np.abs(finite) > 1e-12))
+
+    def _total_comparison_display(self, entry: SpectrumEntry, wn, ab):
+        values = np.asarray(ab, dtype=float)
+        if not self._total_state_has_effective_baseline(entry):
+            active_values = self._mask_total_inactive_ranges(wn, values)
+            finite = active_values[np.isfinite(active_values)]
+            if len(finite):
+                threshold = float(np.percentile(finite, 20.0))
+                low_envelope = finite[finite <= threshold]
+                if len(low_envelope):
+                    values = values - float(np.median(low_envelope))
+        return self._normalize_total_values(wn, values, values)
+
+    def _current_total_inactive_ranges(self) -> list[tuple[float, float]]:
+        session_key = self.spectrum_list.get_current_session_filter()
+        return list(self._total_inactive_ranges.get(session_key, []))
+
+    def _mask_total_inactive_ranges(self, wn, ab):
+        ranges = self._current_total_inactive_ranges()
+        if not ranges:
+            return ab
+        wn_arr = np.asarray(wn, dtype=float)
+        masked = np.asarray(ab, dtype=float).copy()
+        n = min(len(wn_arr), len(masked))
+        for start, end in ranges:
+            lo, hi = sorted((float(start), float(end)))
+            region_mask = (wn_arr[:n] >= lo) & (wn_arr[:n] <= hi)
+            masked[np.flatnonzero(region_mask)] = np.nan
+        return masked
+
+    def _merge_total_ranges(self, ranges):
+        merged = []
+        for start, end in sorted(
+            (sorted((float(a), float(b))) for a, b in ranges),
+            key=lambda pair: pair[0],
+        ):
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return [(start, end) for start, end in merged]
+
+    def _on_total_region_toggled(self, start: float, end: float):
+        if self.right_panel.get_mode() != 'Total':
+            return
+        lo, hi = sorted((float(start), float(end)))
+        if hi - lo <= 1e-9:
+            return
+
+        session_key = self.spectrum_list.get_current_session_filter()
+        ranges = self._current_total_inactive_ranges()
+        midpoint = (lo + hi) * 0.5
+        reactivate = any(a <= midpoint <= b for a, b in ranges)
+
+        if reactivate:
+            updated = []
+            for a, b in ranges:
+                if hi <= a or lo >= b:
+                    updated.append((a, b))
+                    continue
+                if a < lo:
+                    updated.append((a, min(lo, b)))
+                if hi < b:
+                    updated.append((max(hi, a), b))
+            ranges = self._merge_total_ranges(updated)
+            action = "Activated"
+        else:
+            ranges = self._merge_total_ranges(ranges + [(lo, hi)])
+            action = "Deactivated"
+
+        self._total_inactive_ranges[session_key] = ranges
+        self._apply_total_view(preserve_view=True)
+        self.status_label.setText(
+            f"{action} Total region: {lo:.1f}-{hi:.1f} cm⁻¹"
+        )
+
     def _build_total_specs(self) -> list[dict]:
-        entries = self._visible_entries()
+        entries = self._selected_total_entries()
         potentials = self._visible_potentials()
         session_key = self.spectrum_list.get_current_session_filter()
         session_shifts = self._total_shifts.get(session_key, {})
+        allow_manual_shift = (
+            self.right_panel.is_total_shift_enabled()
+            and self.right_panel.get_oh_overlay_intensity_config()['mode'] != 'normalize'
+        )
         pot_values = [potentials[e.name] for e in entries if e.name in potentials]
         pot_min = min(pot_values) if pot_values else None
         pot_max = max(pot_values) if pot_values else None
@@ -535,24 +835,35 @@ class MainWindow(QMainWindow):
         if pot_values:
             ordered.sort(key=lambda e: potentials.get(e.name, float('inf')))
 
-        ranges = [
-            float(np.nanmax(e.absorbance) - np.nanmin(e.absorbance))
-            for e in ordered if len(e.absorbance) > 0
-        ]
+        display_data = {
+            entry.filepath: self._total_display_data_for_entry(entry)
+            for entry in ordered
+        }
+        ranges = []
+        for entry in ordered:
+            x, y = display_data[entry.filepath]
+            y = self._total_comparison_display(entry, x, y)
+            y = self._mask_total_inactive_ranges(x, y)
+            finite = y[np.isfinite(y)]
+            if len(finite) > 0:
+                ranges.append(float(np.max(finite) - np.min(finite)))
         spacing = (np.median(ranges) * 1.25) if ranges else 1.0
         if not np.isfinite(spacing) or spacing <= 0:
             spacing = 1.0
 
         specs = []
         for idx, entry in enumerate(ordered):
+            wn, ab = display_data[entry.filepath]
+            ab = self._total_comparison_display(entry, wn, ab)
+            ab = self._mask_total_inactive_ranges(wn, ab)
             base_shift = idx * spacing if self._total_view_mode == 'stack' else 0.0
             specs.append({
                 'name': entry.name,
                 'filepath': entry.filepath,
-                'wn': entry.wavenumber,
-                'ab': entry.absorbance,
+                'wn': wn,
+                'ab': ab,
                 'base_shift': base_shift,
-                'shift': session_shifts.get(entry.name, 0.0),
+                'shift': session_shifts.get(entry.name, 0.0) if allow_manual_shift else 0.0,
                 'color': self._potential_color(entry, potentials, pot_min, pot_max),
                 'potential': potentials.get(entry.name),
             })
@@ -567,14 +878,74 @@ class MainWindow(QMainWindow):
         specs = self._build_total_specs()
         active_name = self._current_entry.name if self._current_entry is not None else None
         self.plot_widget.show_total_spectra(specs, active_name=active_name)
+        self.plot_widget.set_total_inactive_ranges(
+            self._current_total_inactive_ranges())
+        if self.right_panel.btn_edit_bl.isChecked():
+            state = (
+                self._total_baseline_states.get(self._current_entry.filepath, {})
+                if self._current_entry is not None else {}
+            )
+            active_spec = next(
+                (spec for spec in specs
+                 if spec.get('filepath') == getattr(self._current_entry, 'filepath', None)),
+                None,
+            )
+            wn = np.asarray(state.get('wn', []), dtype=float)
+            raw = np.asarray(state.get('raw', []), dtype=float)
+            baseline = np.asarray(state.get('baseline', []), dtype=float)
+            n = min(len(wn), len(raw), len(baseline))
+            if n and active_spec is not None:
+                display_raw = self._normalize_total_values(
+                    wn[:n], raw[:n], raw[:n])
+                display_raw = self._mask_total_inactive_ranges(
+                    wn[:n], display_raw)
+                display_raw = (
+                    display_raw
+                    + float(active_spec.get('base_shift', 0.0))
+                    + float(active_spec.get('shift', 0.0))
+                )
+                self.plot_widget.set_total_edit_raw_curve(wn[:n], display_raw)
+                display_baseline = self._normalize_total_values(
+                    wn[:n], baseline[:n], raw[:n])
+                display_baseline = self._mask_total_inactive_ranges(
+                    wn[:n], display_baseline)
+                display_baseline = (
+                    display_baseline
+                    + float(active_spec.get('base_shift', 0.0))
+                    + float(active_spec.get('shift', 0.0))
+                )
+                self.plot_widget.set_baseline_curve(wn[:n], display_baseline)
+            self._restore_total_baseline_points_for_current()
         if view_state:
             self._restore_plot_view(view_state)
+        preserve_baseline_view = (
+            view_state is not None
+            and self.right_panel.btn_edit_bl.isChecked()
+        )
+        if self.right_panel.cb_x_auto.isChecked() and not preserve_baseline_view:
+            finite_x = []
+            for spec in specs:
+                values = np.asarray(spec.get('wn', []), dtype=float)
+                values = values[np.isfinite(values)]
+                if len(values):
+                    finite_x.append(values)
+            if finite_x:
+                all_x = np.concatenate(finite_x)
+                self.plot_widget.zoom_to(
+                    float(np.min(all_x)), float(np.max(all_x)), padding=0.03)
+        if self.right_panel.cb_y_auto.isChecked() and not preserve_baseline_view:
+            self.plot_widget.fit_y_to_current_x_range(padding=0.05)
         self.status_label.setText(
             f"Total view  |  {len(specs)} spectra  |  {self._total_view_mode}"
         )
 
     def _on_total_view_changed(self, view_mode: str):
         self._total_view_mode = 'stack' if view_mode == 'stack' else 'overlay'
+        if self.right_panel.get_mode() == 'Total':
+            self._apply_total_view(preserve_view=True)
+
+    def _on_total_shift_toggled(self, enabled: bool):
+        self.plot_widget.set_total_shift_mode(enabled)
         if self.right_panel.get_mode() == 'Total':
             self._apply_total_view(preserve_view=True)
 
@@ -603,16 +974,42 @@ class MainWindow(QMainWindow):
             converted.setdefault(session_key, {})[str(name)] = float(shift)
         return converted
 
+    def _sanitize_total_baseline_states(self, states) -> dict:
+        if not isinstance(states, dict):
+            return {}
+        sanitized = {}
+        for filepath, state in states.items():
+            if not isinstance(state, dict):
+                continue
+            algo = state.get('algo')
+            is_unedited_auto = (
+                algo in ('Auto Baseline', 'OH Auto Baseline')
+                and not state.get('manual_override', False)
+            )
+            if is_unedited_auto:
+                continue
+            sanitized[filepath] = copy.deepcopy(state)
+        return sanitized
+
     def _on_total_shift_changed(self, spectrum_name: str, shift: float):
         session_key = self.spectrum_list.get_current_session_filter()
         self._total_shifts.setdefault(session_key, {})[spectrum_name] = shift
 
     def _on_total_spectrum_selected(self, spectrum_name: str):
         entries = self.spectrum_list.get_all_entries()
+        selected_paths = {
+            item.data(Qt.UserRole)
+            for item in self.spectrum_list.list_widget.selectedItems()
+            if item is not None
+        }
         for row, entry in enumerate(entries):
             if entry.name == spectrum_name:
                 if self.spectrum_list.list_widget.currentRow() != row:
                     self.spectrum_list.list_widget.setCurrentRow(row)
+                    for i in range(self.spectrum_list.list_widget.count()):
+                        item = self.spectrum_list.list_widget.item(i)
+                        if item is not None and item.data(Qt.UserRole) in selected_paths:
+                            item.setSelected(True)
                 break
 
     def _reset_total_shifts(self):
@@ -735,9 +1132,9 @@ class MainWindow(QMainWindow):
         if not spectra_data:
             return 0
 
-        existing_labels = self._session_labels_in_use()
-        fallback_label = Path(session_path).stem
-        mapped_label = self._make_unique_session_label(fallback_label, existing_labels)
+        session_label_map, is_workspace_payload = self._session_import_label_map(
+            data, session_path, spectra_data)
+        fallback_label = next(iter(session_label_map.values()), Path(session_path).stem)
 
         names_in_use = {entry.name for entry in self.spectrum_list.get_all_entries()}
         keys_in_use = {entry.filepath for entry in self.spectrum_list.get_all_entries()}
@@ -747,6 +1144,8 @@ class MainWindow(QMainWindow):
 
         for idx, spectrum in enumerate(spectra_data):
             original_name = spectrum.get('original_name') or spectrum.get('name') or Path(spectrum.get('filepath', '')).name
+            old_session_key = self._saved_session_key_for_spectrum(spectrum)
+            mapped_label = session_label_map.get(old_session_key, fallback_label)
             display_name = self._make_unique_display_name(mapped_label, original_name, names_in_use)
             source_filepath = spectrum.get('source_spectrum_path') or spectrum.get('filepath', '')
             import_key = self._make_import_key(mapped_label, original_name, source_filepath, idx, keys_in_use)
@@ -786,6 +1185,33 @@ class MainWindow(QMainWindow):
             new_fp = old_to_new_fp.get(old_fp)
             if new_fp is not None:
                 self._spectrum_states[new_fp] = copy.deepcopy(state)
+
+        for old_fp, state in data.get('total_baseline_states', {}).items():
+            new_fp = old_to_new_fp.get(old_fp)
+            sanitized = self._sanitize_total_baseline_states({old_fp: state})
+            if new_fp is not None and old_fp in sanitized:
+                self._total_baseline_states[new_fp] = copy.deepcopy(state)
+
+        imported_inactive_ranges = data.get('total_inactive_ranges', {})
+        if isinstance(imported_inactive_ranges, dict):
+            if is_workspace_payload:
+                for old_session_key, ranges in imported_inactive_ranges.items():
+                    if not isinstance(ranges, (list, tuple)):
+                        continue
+                    mapped_label = session_label_map.get(str(old_session_key))
+                    if mapped_label is None:
+                        continue
+                    mapped_key = self._session_key_for_import_label(mapped_label)
+                    self._total_inactive_ranges[mapped_key] = self._merge_total_ranges(ranges)
+            else:
+                merged_ranges = []
+                for ranges in imported_inactive_ranges.values():
+                    if isinstance(ranges, (list, tuple)):
+                        merged_ranges.extend(ranges)
+                if merged_ranges:
+                    mapped_key = self._session_key_for_import_label(fallback_label)
+                    self._total_inactive_ranges[mapped_key] = self._merge_total_ranges(
+                        merged_ranges)
 
         for old_fp, state in data.get('co_states', {}).items():
             new_fp = old_to_new_fp.get(old_fp)
@@ -828,7 +1254,7 @@ class MainWindow(QMainWindow):
                             mapped_session = (
                                 entry.source_session_label
                                 if entry is not None and entry.source_session_label
-                                else mapped_label
+                                else self.spectrum_list.LOOSE_FILES_KEY
                             )
                             self._total_shifts.setdefault(mapped_session, {})[new_name] = float(shift)
             else:
@@ -1059,24 +1485,9 @@ class MainWindow(QMainWindow):
             self._refresh_current_mode_view_after_defaults()
 
     def _initialize_auto_analysis_defaults(self, entry: SpectrumEntry):
-        cfg = self.right_panel.get_config()
-        wn_oh, ab_oh = crop_region(
-            entry.wavenumber, entry.absorbance, cfg['wn_min'], cfg['wn_max'])
-        auto_points = auto_oh_baseline_points(wn_oh, ab_oh)
-        baseline = (baseline_from_points(wn_oh, ab_oh, auto_points)
-                    if len(auto_points) >= 2 else np.zeros_like(ab_oh))
-
-        self._spectrum_states.setdefault(entry.filepath, {
-            'wn_crop': wn_oh.copy(),
-            'ab_crop': ab_oh.copy(),
-            'baseline': baseline.copy(),
-            'ab_corrected': subtract_baseline(ab_oh, baseline),
-            'fit_result': None,
-            'guesses': [],
-            'locks': [],
-            'baseline_points': list(auto_points),
-            'snapshots': [],
-        })
+        # Baseline is now created explicitly in Total. New spectra should not
+        # receive OH-specific anchor points merely because they were loaded.
+        return
 
     def _refresh_current_mode_view_after_defaults(self):
         row = self.spectrum_list.list_widget.currentRow()
@@ -1085,21 +1496,12 @@ class MainWindow(QMainWindow):
             return
         self._on_spectrum_selected(entry)
 
-        co_eps = auto_co_baseline_endpoints(entry.wavenumber, entry.absorbance)
-        co_state = self._co_states.setdefault(entry.filepath, {})
-        for sub, default_eps in [('CO_L', (2000.0, 2100.0)), ('CO_B', (1650.0, 1900.0))]:
-            ep0, ep1 = co_eps.get(sub, default_eps)
-            sub_state = co_state.setdefault(sub, {})
-            sub_state.setdefault('ep0', ep0)
-            sub_state.setdefault('ep1', ep1)
-            sub_state.setdefault('fit_result', None)
-            sub_state.setdefault('manual_override', False)
-
     def _on_spectrum_removed(self, index: int, filepath: str, name: str):
         self.spectrum_list.remove_spectrum_potential(name, emit_changed=False)
 
         # 상태 정리
         self._spectrum_states.pop(filepath, None)
+        self._total_baseline_states.pop(filepath, None)
         self._fit_records = [r for r in self._fit_records
                              if r['filename'] != name]
         self._co_fit_records = [r for r in self._co_fit_records
@@ -1188,6 +1590,7 @@ class MainWindow(QMainWindow):
         self._wn_crop         = None
         self._ab_crop         = None
         self._baseline_points = []
+        self._total_baseline_states = {}
         self.plot_widget._clear_all()
         self.right_panel.clear_current_summary()
         self.right_panel.set_snapshot_names([], selected_index=-1)
@@ -1209,6 +1612,56 @@ class MainWindow(QMainWindow):
         if view_state is not None:
             self.plot_widget.restore_view_state(view_state)
 
+    def _oh_display_data_for_entry(self, entry):
+        if (
+            self._current_entry is not None
+            and entry.filepath == self._current_entry.filepath
+            and self._wn_crop is not None
+            and self._ab_corrected is not None
+        ):
+            return self._wn_crop, self._ab_corrected
+
+        state = self._spectrum_states.get(entry.filepath)
+        if state is not None:
+            wn = state.get('wn_crop')
+            ab = state.get('ab_corrected')
+            if wn is not None and ab is not None:
+                return wn, ab
+
+        return entry.wavenumber, entry.absorbance
+
+    def _max_in_wavenumber_range(self, wn, ab, wn_min: float, wn_max: float):
+        wn_arr = np.asarray(wn, dtype=float)
+        ab_arr = np.asarray(ab, dtype=float)
+        if len(wn_arr) == 0 or len(ab_arr) == 0:
+            return None
+        n = min(len(wn_arr), len(ab_arr))
+        wn_arr = wn_arr[:n]
+        ab_arr = ab_arr[:n]
+        lo, hi = sorted((float(wn_min), float(wn_max)))
+        mask = (wn_arr >= lo) & (wn_arr <= hi) & np.isfinite(ab_arr)
+        if not np.any(mask):
+            return None
+        max_value = float(np.nanmax(ab_arr[mask]))
+        if not np.isfinite(max_value) or abs(max_value) < 1e-12:
+            return None
+        return max_value
+
+    def _normalize_oh_overlay(self, wn, ab):
+        cfg = self.right_panel.get_oh_overlay_intensity_config()
+        if cfg['mode'] != 'normalize' or self._current_entry is None:
+            return ab
+
+        ref_wn, ref_ab = self._oh_display_data_for_entry(self._current_entry)
+        ref_max = self._max_in_wavenumber_range(
+            ref_wn, ref_ab, cfg['wn_min'], cfg['wn_max'])
+        ab_max = self._max_in_wavenumber_range(
+            wn, ab, cfg['wn_min'], cfg['wn_max'])
+        if ref_max is None or ab_max is None:
+            return ab
+
+        return np.asarray(ab, dtype=float) * (ref_max / ab_max)
+
     def _build_overlay_spectra(self, entries):
         mode = self.right_panel.get_mode()
         overlays = []
@@ -1217,10 +1670,7 @@ class MainWindow(QMainWindow):
             ab = entry.absorbance
 
             if mode == 'OH':
-                state = self._spectrum_states.get(entry.filepath)
-                if state is not None:
-                    wn = state.get('wn_crop', wn)
-                    ab = state.get('ab_corrected', ab)
+                wn, ab = self._oh_display_data_for_entry(entry)
                 kind = 'corrected'
             else:
                 kind = 'raw'
@@ -1235,13 +1685,21 @@ class MainWindow(QMainWindow):
         return overlays
 
     def _refresh_selected_overlays(self, view_state=None):
-        if self.right_panel.get_mode() == 'Total':
+        if self.right_panel.get_mode() in ('Total', 'SiO'):
             return
         selected_entries = self.spectrum_list.get_selected_entries()
         active_path = self._current_entry.filepath if self._current_entry is not None else None
         overlays = self._build_overlay_spectra(selected_entries)
         self.plot_widget.set_overlay_spectra(overlays, active_path)
         self._restore_plot_view(view_state)
+
+    def _on_oh_overlay_intensity_changed(self):
+        if self.right_panel.get_mode() != 'Total':
+            return
+        if self.right_panel.get_oh_overlay_intensity_config()['mode'] == 'normalize':
+            self.plot_widget.set_total_shift_mode(False)
+            self.right_panel.set_total_shift_checked(False)
+        self._apply_total_view(preserve_view=True)
 
     def _get_oh_snapshots(self, filepath: str | None = None):
         if filepath is None:
@@ -1336,17 +1794,15 @@ class MainWindow(QMainWindow):
         self.right_panel.set_oh_snapshot_config(
             config,
             snapshot_state.get('n_peaks'),
-            baseline_edit_enabled=snapshot_state.get('baseline_edit_enabled'),
+            baseline_edit_enabled=False,
         )
 
         self.plot_widget.set_raw_spectrum(
             self._current_entry.wavenumber,
             self._current_entry.absorbance,
         )
-        self.plot_widget.set_corrected_spectrum(self._wn_crop, self._ab_corrected, self._baseline)
+        self.plot_widget.show_highlighted_region(self._wn_crop, self._ab_corrected)
         self.plot_widget.show_analysis_region([(config['wn_min'], config['wn_max'])])
-        if self._baseline_points:
-            self.plot_widget.restore_baseline_points(self._baseline_points)
 
         self.right_panel.set_guesses(guesses, locks=locks)
 
@@ -1435,8 +1891,7 @@ class MainWindow(QMainWindow):
         if mode == 'Total':
             self.right_panel.set_guesses([], locks=[])
             self.right_panel.clear_results()
-            if not self.plot_widget.set_total_active_spectrum(entry.name):
-                self._apply_total_view(preserve_view=True)
+            self._apply_total_view(preserve_view=True)
             self._sync_analysis_sidebar()
             return
 
@@ -1447,19 +1902,21 @@ class MainWindow(QMainWindow):
         # 저장된 상태가 있으면 복원
         saved = self._spectrum_states.get(entry.filepath)
         if saved:
-            self._wn_crop         = saved['wn_crop']
-            self._ab_crop         = saved['ab_crop']
-            self._baseline        = saved['baseline']
-            self._ab_corrected    = saved['ab_corrected']
-            self._fit_result      = saved['fit_result']
-            self._baseline_points = list(saved['baseline_points'])
+            self._wn_crop = saved.get('wn_crop')
+            self._ab_crop = saved.get('ab_crop')
+            self._baseline = saved.get('baseline')
+            self._ab_corrected = saved.get('ab_corrected')
+            self._fit_result = saved.get('fit_result')
+            self._baseline_points = list(saved.get('baseline_points', []))
 
-            if mode == 'OH':
-                self.plot_widget.set_corrected_spectrum(
-                    self._wn_crop, self._ab_corrected, self._baseline)
-                if self._baseline_points:
-                    self.plot_widget.restore_baseline_points(self._baseline_points)
-                self.right_panel.set_guesses(saved['guesses'], locks=saved.get('locks', []))
+            if mode == 'OH' and self._wn_crop is not None and self._ab_corrected is not None:
+                if self._ab_crop is None:
+                    self._ab_crop = np.asarray(self._ab_corrected, dtype=float).copy()
+                if self._baseline is None:
+                    self._baseline = np.zeros_like(self._ab_corrected)
+                self.plot_widget.show_highlighted_region(
+                    self._wn_crop, self._ab_corrected)
+                self.right_panel.set_guesses(saved.get('guesses', []), locks=saved.get('locks', []))
 
                 if self._fit_result is not None:
                     ab = np.maximum(self._ab_corrected, 0)
@@ -1471,7 +1928,7 @@ class MainWindow(QMainWindow):
                         f"{entry.name}  |  R²={self._fit_result.r_squared:.5f} (restored)"
                     )
                 else:
-                    self.plot_widget.show_peak_guesses(self._wn_crop, saved['guesses'])
+                    self.plot_widget.show_peak_guesses(self._wn_crop, saved.get('guesses', []))
                     self.right_panel.clear_results()
                     if self._ab_corrected is not None and self._wn_crop is not None:
                         total_oh = abs(float(_trapezoid(self._ab_corrected, self._wn_crop)))
@@ -1488,18 +1945,13 @@ class MainWindow(QMainWindow):
                 f"{entry.name}  |  {len(entry.wavenumber)} pts  "
                 f"|  {entry.wavenumber[0]:.0f}–{entry.wavenumber[-1]:.0f} cm⁻¹"
             )
-            # 저장 상태 없이 처음 로드 시 → OH 모드에서만 baseline 계산
-            if mode == 'OH':
-                self._update_baseline()
-
         # 분석 영역 표시 복원 + 줌
         cfg = self.right_panel.get_config()
         if mode == 'OH':
             wn_min, wn_max = cfg['wn_min'], cfg['wn_max']
             self.plot_widget.show_analysis_region([(wn_min, wn_max)])
             self.plot_widget.zoom_to(wn_min, wn_max)
-            # baseline 재계산 → corrected spectrum + wn_crop 갱신
-            if not saved:
+            if not saved or self._wn_crop is None or self._ab_corrected is None:
                 self._update_baseline()
         elif mode == 'CO':
             self._apply_co_view(entry)
@@ -1513,112 +1965,225 @@ class MainWindow(QMainWindow):
         self._sync_analysis_sidebar()
 
     def _apply_co_view(self, entry: SpectrumEntry | None, preserve_view: bool = False):
-        cfg = self.right_panel.get_config()
         view_state = self.plot_widget.get_view_state() if preserve_view else None
+        wn_min, wn_max = self._co_display_region_for_entry(entry)
         self._co_drag_targets = {}
         self.plot_widget.clear_fit_result()
         self.plot_widget.clear_baseline_curve()
         self.plot_widget.clear_analysis_region()
         if entry is None:
             if not preserve_view:
-                self.plot_widget.zoom_to(cfg['wn_min'], cfg['wn_max'])
+                self.plot_widget.zoom_to(wn_min, wn_max)
             self.right_panel.set_co_guesses([])
             return
 
-        wn, ab = crop_region(entry.wavenumber, entry.absorbance,
-                             cfg['wn_min'], cfg['wn_max'])
+        wn, _, _, analysis_ab, _ = self._analysis_arrays_for_entry(
+            entry, wn_min, wn_max)
+        self.plot_widget.show_highlighted_region(wn, analysis_ab)
 
-        co_state = self._co_states.get(entry.filepath, {})
-        if not co_state or 'CO_L' not in co_state or 'CO_B' not in co_state:
-            auto_eps = auto_co_baseline_endpoints(entry.wavenumber, entry.absorbance)
-            co_state = self._co_states.setdefault(entry.filepath, {})
-            for sub, default_eps in [('CO_L', (2000.0, 2100.0)), ('CO_B', (1650.0, 1900.0))]:
-                ep0, ep1 = auto_eps.get(sub, default_eps)
-                sub_state = co_state.setdefault(sub, {})
-                sub_state.setdefault('ep0', ep0)
-                sub_state.setdefault('ep1', ep1)
-                sub_state.setdefault('fit_result', None)
-                sub_state.setdefault('manual_override', False)
-        l_eps = (co_state.get('CO_L', {}).get('ep0', 2000.0),
-                 co_state.get('CO_L', {}).get('ep1', 2100.0))
-        b_eps = (co_state.get('CO_B', {}).get('ep0', 1650.0),
-                 co_state.get('CO_B', {}).get('ep1', 1900.0))
-
-        full_baseline = None
-        if self._co_uses_endpoint_linear_baseline(cfg.get('baseline_algo')):
-            self.plot_widget.show_highlighted_region(wn, ab)
-        else:
-            full_baseline = self._compute_co_full_baseline(
-                entry,
-                algo=cfg['baseline_algo'],
-                params=cfg['baseline_params'],
-                restore_points=self.right_panel.btn_edit_bl.isChecked(),
-            )
-            _, _, bl, ab_corr, _ = full_baseline
-            self.plot_widget.set_corrected_spectrum(wn, ab_corr, bl)
-
-        self.plot_widget.show_co_baselines(
-            entry.wavenumber,
-            entry.absorbance,
-            l_eps,
-            b_eps,
-            draw_baseline=full_baseline is None,
-        )
-
-        co_locks = co_state.get('CO_B', {}).get('locks', [])
-        raw_fit = co_state.get('CO_B', {}).get('raw_fit_result')
+        co_state = self._co_states.setdefault(entry.filepath, {})
+        manual = self._ensure_co_manual_state(entry)
+        co_locks = manual.get('locks', [])
+        raw_fit = manual.get('fit_result')
+        co_guesses = manual.get('guesses') or []
         if raw_fit and raw_fit.success:
             self._restore_co_b_fit_viz(entry, co_state)
-            self.right_panel.set_co_guesses(co_state.get('CO_B', {}).get('guesses', []), locks=co_locks)
+            self.right_panel.set_co_guesses(co_guesses, locks=co_locks)
         else:
-            co_b_guesses = co_state.get('CO_B', {}).get('guesses')
-            if co_b_guesses and self.right_panel.get_co_b_fit_mode() != 'simple_only':
-                ep0_b, ep1_b = sorted(b_eps)
-                wn_b, _, bl_b, _ = self._co_subregion_data(
-                    entry, ep0_b, ep1_b, full_baseline=full_baseline)
+            if co_guesses:
+                wn_b, _, _, _ = self._co_b_fit_data(entry)
                 if len(wn_b) >= 5:
                     self._co_drag_targets = {
-                        i: {'type': 'co_b_guess', 'sub': 'CO_B', 'peak_idx': i}
-                        for i in range(len(co_b_guesses))
+                        i: {'type': 'co_peak_guess', 'peak_idx': i}
+                        for i in range(len(co_guesses))
                     }
                     self.plot_widget.show_peak_guesses(
                         wn_b,
-                        co_b_guesses,
-                        baseline=self._co_display_baseline(bl_b, full_baseline),
+                        co_guesses,
+                        baseline=None,
                     )
-                self.right_panel.set_co_guesses(co_b_guesses, locks=co_locks)
+                self.right_panel.set_co_guesses(co_guesses, locks=co_locks)
             else:
                 self.right_panel.set_co_guesses([])
 
         co_l = co_state.get('CO_L', {}).get('fit_result')
         co_b = co_state.get('CO_B', {}).get('fit_result')
+        if not (raw_fit and raw_fit.success) and not co_guesses:
+            markers = []
+            self._co_drag_targets = {}
+            for sub, result, color in (
+                ('CO_L', co_l, '#89b4fa'),
+                ('CO_B', co_b, '#fab387'),
+            ):
+                if result and result.success and result.peaks:
+                    idx = len(markers)
+                    markers.append({
+                        'center': result.peaks[0].center,
+                        'label': sub,
+                        'color': color,
+                    })
+                    self._co_drag_targets[idx] = {'type': 'simple', 'sub': sub}
+            if markers:
+                self.plot_widget.show_peak_center_markers(markers)
         self.right_panel.update_co_results(co_l, co_b)
         if preserve_view and view_state:
             self.plot_widget.restore_view_state(view_state)
         else:
-            self.plot_widget.zoom_to(cfg['wn_min'], cfg['wn_max'])
+            self.plot_widget.zoom_to(wn_min, wn_max)
 
     def _apply_sio_view(self, entry: SpectrumEntry | None):
         cfg = self.right_panel.get_config()
-        self.plot_widget.clear_fit_result()
-        self.plot_widget.clear_baseline_curve()
+        self.plot_widget._clear_all()
         self.plot_widget.show_analysis_region([(cfg['wn_min'], cfg['wn_max'])])
         if entry is None:
             self.plot_widget.zoom_to(cfg['wn_min'], cfg['wn_max'])
             return
 
-        wn, ab = crop_region(entry.wavenumber, entry.absorbance,
-                             cfg['wn_min'], cfg['wn_max'])
-        self.plot_widget.show_highlighted_region(wn, ab)
-
+        wn_full = np.asarray(entry.wavenumber, dtype=float)
+        finite_wn = wn_full[np.isfinite(wn_full)]
+        if len(finite_wn):
+            display_min, display_max = float(np.min(finite_wn)), float(np.max(finite_wn))
+        else:
+            display_min, display_max = cfg['wn_min'], cfg['wn_max']
+        wn_display, _, _, corrected_display, source = self._analysis_arrays_for_entry(
+            entry, display_min, display_max)
+        self.plot_widget.show_highlighted_region(wn_display, corrected_display)
         sio_state = self._sio_states.get(entry.filepath, {})
-        eps = (sio_state.get('ep0', 1100.0), sio_state.get('ep1', 1300.0))
-        self.plot_widget.show_sio_baseline(entry.wavenumber, entry.absorbance, eps)
+        eps = (
+            float(sio_state.get('ep0', cfg['wn_min'])),
+            float(sio_state.get('ep1', cfg['wn_max'])),
+        )
+        self.plot_widget.show_sio_region_handles(
+            np.asarray(entry.wavenumber, dtype=float),
+            np.asarray(entry.absorbance, dtype=float),
+            eps,
+        )
         self.plot_widget.zoom_to(cfg['wn_min'], cfg['wn_max'])
 
         self.right_panel.update_sio_area(self._get_sio_area_for_entry(entry))
+        self.status_label.setText(
+            f"Si-O view  |  {cfg['wn_min']:.0f}–{cfg['wn_max']:.0f} cm⁻¹  |  source={source}"
+        )
 
     # ── 영역 / 베이스라인 ─────────────────────────────────────
+
+    def _calculate_baseline_data(self, entry: SpectrumEntry, algo: str,
+                                 params: dict, points: list | None = None):
+        cfg = self.right_panel.get_config()
+        wn, ab = crop_region(
+            entry.wavenumber,
+            entry.absorbance,
+            cfg['wn_min'],
+            cfg['wn_max'],
+        )
+        points = list(points or [])
+        if len(wn) == 0:
+            return {
+                'wn': wn.copy(),
+                'raw': ab.copy(),
+                'baseline': np.zeros_like(ab),
+                'corrected': ab.copy(),
+                'points': [],
+                'algo': algo,
+                'params': copy.deepcopy(params),
+                'region': (float(cfg['wn_min']), float(cfg['wn_max'])),
+            }
+
+        if algo == 'Manual':
+            bl = baseline_from_points(wn, ab, points) if len(points) >= 2 else np.zeros_like(ab)
+        elif algo == 'Rubber Band':
+            points = []
+            bl = baseline_rubberband(wn, ab)
+        elif algo == 'ARPLS':
+            points = []
+            bl = baseline_arpls(ab, lam=params.get('lam', 1e4))
+        elif algo == 'SNIP':
+            points = []
+            bl = baseline_snip(ab, n_iter=params.get('n_iter', 50))
+        elif algo == 'Linear':
+            points = []
+            bl = baseline_linear(wn, ab)
+        else:
+            points = []
+            bl = np.zeros_like(ab)
+
+        return {
+            'wn': wn.copy(),
+            'raw': ab.copy(),
+            'baseline': bl.copy(),
+            'corrected': subtract_baseline(ab, bl),
+            'points': list(points),
+            'algo': algo,
+            'params': copy.deepcopy(params),
+            'region': (float(cfg['wn_min']), float(cfg['wn_max'])),
+        }
+
+    def _update_total_baseline_for_entries(self, entries: list[SpectrumEntry],
+                                           algo: str | None = None,
+                                           params: dict | None = None,
+                                           manual_override: bool | None = None):
+        if not entries:
+            return
+        cfg = self.right_panel.get_config()
+        algo = algo or cfg['baseline_algo']
+        params = params if params is not None else cfg['baseline_params']
+        active_path = self._current_entry.filepath if self._current_entry is not None else None
+
+        for entry in entries:
+            existing = self._total_baseline_states.get(entry.filepath, {})
+            entry_algo = algo
+            points = []
+            if entry_algo == 'Manual':
+                if entry.filepath != active_path:
+                    continue
+                points = list(existing.get('points', []))
+            state = self._calculate_baseline_data(entry, entry_algo, params, points)
+            state['manual_override'] = (
+                bool(manual_override)
+                if manual_override is not None
+                else entry_algo == 'Manual'
+            )
+            self._total_baseline_states[entry.filepath] = state
+
+        self._apply_total_view(preserve_view=True)
+
+    def _restore_total_baseline_points_for_current(self):
+        self.plot_widget.clear_baseline_points()
+        if self._current_entry is None:
+            return
+        state = self._total_baseline_states.get(self._current_entry.filepath, {})
+        points = state.get('points', [])
+        if not points:
+            return
+
+        active_spec = next(
+            (spec for spec in self._build_total_specs()
+             if spec.get('filepath') == self._current_entry.filepath),
+            None,
+        )
+        if active_spec is None:
+            self.plot_widget.restore_baseline_points(points)
+            return
+
+        spec_wn = np.asarray(state.get('wn', active_spec['wn']), dtype=float)
+        spec_ab = np.asarray(state.get('raw', active_spec['ab']), dtype=float)
+        n = min(len(spec_wn), len(spec_ab))
+        display_points = []
+        for point_wn, point_y in points:
+            if n == 0:
+                continue
+            display_y = self._normalize_total_values(
+                spec_wn[:n],
+                np.asarray([float(point_y)], dtype=float),
+                spec_ab[:n],
+            )[0]
+            display_points.append((
+                float(point_wn),
+                float(display_y)
+                + float(active_spec.get('base_shift', 0.0))
+                + float(active_spec.get('shift', 0.0)),
+            ))
+        self.plot_widget.restore_baseline_points(display_points)
 
     def _on_region_changed(self, wn_min, wn_max):
         mode = self.right_panel.get_mode()
@@ -1629,228 +2194,144 @@ class MainWindow(QMainWindow):
 
         if mode == 'Total':
             self.plot_widget.clear_analysis_region()
+            self._update_total_baseline_for_entries(self._selected_total_entries())
             self.plot_widget.zoom_to(wn_min, wn_max)
         elif mode == 'OH':
-            self._apply_oh_region_to_all_spectra(wn_min, wn_max)
             self._update_baseline()
             self._refresh_oh_stark_results(self._visible_potentials())
         elif mode == 'CO':
             if self._current_entry is not None:
                 self._apply_co_view(self._current_entry)
-            self.plot_widget.zoom_to(wn_min, wn_max)
-
-    def _apply_oh_region_to_all_spectra(self, wn_min: float, wn_max: float):
-        cfg = self.right_panel.get_config()
-        algo = cfg['baseline_algo']
-        params = cfg['baseline_params']
-        affected_names = set()
-
-        for entry in self.spectrum_list.get_all_entries():
-            wn, ab = crop_region(entry.wavenumber, entry.absorbance, wn_min, wn_max)
-            if len(wn) == 0:
-                continue
-
-            existing = self._spectrum_states.get(entry.filepath, {})
-            manual_points = [
-                pt for pt in existing.get('baseline_points', [])
-                if wn_min <= pt[0] <= wn_max or wn_max <= pt[0] <= wn_min
-            ]
-            manual_override = bool(existing.get('baseline_manual_override', False))
-
-            if algo == 'Manual' or (algo == 'OH Auto Baseline' and manual_override and len(manual_points) >= 2):
-                baseline_points = list(manual_points)
-                bl = (baseline_from_points(wn, ab, baseline_points)
-                      if len(baseline_points) >= 2 else np.zeros_like(ab))
-            elif algo == 'OH Auto Baseline':
-                baseline_points = auto_oh_baseline_points(wn, ab)
-                bl = (baseline_from_points(wn, ab, baseline_points)
-                      if len(baseline_points) >= 2 else np.zeros_like(ab))
-                manual_override = False
-            elif algo == 'Rubber Band':
-                baseline_points = []
-                bl = baseline_rubberband(wn, ab)
-                manual_override = False
-            elif algo == 'ARPLS':
-                baseline_points = []
-                bl = baseline_arpls(ab, lam=params.get('lam', 1e4))
-                manual_override = False
-            elif algo == 'SNIP':
-                baseline_points = []
-                bl = baseline_snip(ab, n_iter=params.get('n_iter', 50))
-                manual_override = False
-            elif algo == 'Linear':
-                baseline_points = []
-                bl = baseline_linear(wn, ab)
-                manual_override = False
-            else:
-                baseline_points = []
-                bl = np.zeros_like(ab)
-                manual_override = False
-
-            snapshots = existing.get('snapshots', [])
-            self._spectrum_states[entry.filepath] = {
-                'wn_crop':        wn.copy(),
-                'ab_crop':        ab.copy(),
-                'baseline':       bl.copy(),
-                'ab_corrected':   subtract_baseline(ab, bl),
-                'fit_result':     None,
-                'guesses':        [],
-                'locks':          existing.get('locks', []),
-                'baseline_points': list(baseline_points),
-                'baseline_manual_override': manual_override,
-                'snapshots':      snapshots,
-            }
-            affected_names.add(entry.name)
-
-        if affected_names:
-            self._fit_records = [
-                r for r in self._fit_records
-                if r.get('filename') not in affected_names
-            ]
+            self.plot_widget.zoom_to(*self._co_display_region_for_entry(self._current_entry))
         elif mode == 'SiO':
-            self.plot_widget.clear_baseline_curve()
             if self._current_entry is not None:
-                wn, ab = crop_region(
-                    self._current_entry.wavenumber,
-                    self._current_entry.absorbance,
-                    wn_min, wn_max
-                )
-                self.plot_widget.show_highlighted_region(wn, ab)
-                sio_state = self._sio_states.get(self._current_entry.filepath, {})
-                eps = (sio_state.get('ep0', 1100.0), sio_state.get('ep1', 1300.0))
-                self.plot_widget.show_sio_baseline(
-                    self._current_entry.wavenumber, self._current_entry.absorbance, eps)
-            self.plot_widget.zoom_to(wn_min, wn_max)
+                sio_state = self._sio_states.setdefault(self._current_entry.filepath, {})
+                sio_state['ep0'] = float(wn_min)
+                sio_state['ep1'] = float(wn_max)
+                sio_state['region'] = tuple(sorted((float(wn_min), float(wn_max))))
+                self._apply_sio_view(self._current_entry)
 
     def _on_bl_mode_toggled(self, enabled: bool):
         """Edit Baseline 버튼 ON/OFF"""
         cfg = self.right_panel.get_config()
         mode = self.right_panel.get_mode()
-        is_editable = cfg['baseline_algo'] in ('Manual', 'OH Auto Baseline')
+        if mode != 'Total':
+            self.plot_widget.set_baseline_edit_mode(False)
+            self.plot_widget.clear_baseline_points()
+            return
+        is_editable = cfg['baseline_algo'] == 'Manual'
         self.plot_widget.set_baseline_edit_mode(enabled and is_editable)
         if enabled:
-            if mode == 'CO':
-                self._update_co_baseline_for_current(
-                    algo=cfg['baseline_algo'],
-                    params=cfg['baseline_params'],
-                )
-            else:
-                self._update_baseline()
+            self._update_total_baseline_for_entries(
+                self._selected_total_entries(),
+                algo=cfg['baseline_algo'],
+                params=cfg['baseline_params'],
+            )
+            self._restore_total_baseline_points_for_current()
+        else:
+            self.plot_widget.clear_baseline_points()
+            self._apply_total_view(preserve_view=True)
 
     def _on_bl_apply(self, algo: str, params: dict):
         """알고리즘 또는 파라미터 변경 시 즉시 재계산"""
-        if self.right_panel.get_mode() == 'CO':
-            current_store = (
-                self._co_baseline_store(self._current_entry)
-                if self._current_entry is not None else {}
-            )
-            if algo == 'OH Auto Baseline' and current_store.get('manual_override'):
-                algo = 'Manual'
+        mode = self.right_panel.get_mode()
+        if mode == 'Total':
             is_manual = (algo == 'Manual')
-            is_oh_auto = (algo == 'OH Auto Baseline')
             bl_on = self.right_panel.btn_edit_bl.isChecked()
-            self.plot_widget.set_baseline_edit_mode(bl_on and (is_manual or is_oh_auto))
-            if self._current_entry is None:
-                return
-            if not (is_manual or is_oh_auto):
-                self._co_baseline_store(self._current_entry)['points'] = []
-                self._co_baseline_store(self._current_entry)['manual_override'] = False
+            self.plot_widget.set_baseline_edit_mode(bl_on and is_manual)
+            if not is_manual:
                 self.plot_widget.clear_baseline_points()
-            self._update_co_baseline_for_current(
+            self._update_total_baseline_for_entries(
+                self._selected_total_entries(),
                 algo=algo,
                 params=params,
-                manual_override=(True if is_manual else None),
+                manual_override=(True if is_manual else False),
             )
+            if is_manual:
+                self._restore_total_baseline_points_for_current()
             return
 
-        current_state = (
-            self._spectrum_states.get(self._current_entry.filepath, {})
-            if self._current_entry is not None else {}
-        )
-        if algo == 'OH Auto Baseline' and current_state.get('baseline_manual_override'):
-            algo = 'Manual'
-
-        is_manual = (algo == 'Manual')
-        is_oh_auto = (algo == 'OH Auto Baseline')
-        bl_on = self.right_panel.btn_edit_bl.isChecked()
-        self.plot_widget.set_baseline_edit_mode(bl_on and (is_manual or is_oh_auto))
-        if not (is_manual or is_oh_auto):
-            # 자동 알고리즘 전환 시 수동 포인트 초기화
-            self._baseline_points.clear()
-            self.plot_widget.clear_baseline_points()
-        self._update_baseline(algo=algo, params=params)
-        if not (is_manual or is_oh_auto):
-            self._save_current_spectrum_state(baseline_manual_override=False)
+        self.plot_widget.set_baseline_edit_mode(False)
 
     def _on_bl_undo(self):
-        if self.right_panel.get_mode() == 'CO':
+        mode = self.right_panel.get_mode()
+        if mode == 'Total':
             if self._current_entry is None:
                 return
-            store = self._co_baseline_store(self._current_entry)
-            points = list(store.get('points', []))
+            state = self._total_baseline_states.get(self._current_entry.filepath, {})
+            points = list(state.get('points', []))
             if points:
                 points.pop()
-                store['points'] = points
-                store['manual_override'] = True
+                state['points'] = points
+                state['manual_override'] = True
+                self._total_baseline_states[self._current_entry.filepath] = state
                 self.plot_widget.undo_last_baseline_point()
-                self._update_co_baseline_for_current(algo='Manual', manual_override=True)
+                self._update_total_baseline_for_entries(
+                    [self._current_entry], algo='Manual', manual_override=True)
             return
-
-        if self._baseline_points:
-            self._baseline_points.pop()
-            self.plot_widget.undo_last_baseline_point()
-            self._update_baseline(algo='Manual')
-            self._save_current_spectrum_state(baseline_manual_override=True)
 
     def _on_bl_clear(self):
-        if self.right_panel.get_mode() == 'CO':
+        mode = self.right_panel.get_mode()
+        if mode == 'Total':
             if self._current_entry is None:
                 return
-            store = self._co_baseline_store(self._current_entry)
-            store['points'] = []
-            store['manual_override'] = True
+            state = self._total_baseline_states.get(self._current_entry.filepath, {})
+            state['points'] = []
+            state['manual_override'] = True
+            self._total_baseline_states[self._current_entry.filepath] = state
             self.plot_widget.clear_baseline_points()
-            self._update_co_baseline_for_current(algo='Manual', manual_override=True)
+            self._update_total_baseline_for_entries(
+                [self._current_entry], algo='Manual', manual_override=True)
             return
-
-        self._baseline_points.clear()
-        self.plot_widget.clear_baseline_points()
-        self._update_baseline(algo='Manual')
-        self._save_current_spectrum_state(baseline_manual_override=True)
 
     def _on_baseline_point_added(self, wn, ab):
-        if self.right_panel.get_mode() == 'CO':
+        mode = self.right_panel.get_mode()
+        if mode == 'Total':
             if self._current_entry is None:
                 return
-            store = self._co_baseline_store(self._current_entry)
-            points = list(store.get('points', []))
-            points.append((wn, ab))
-            store['points'] = points
-            store['manual_override'] = True
-            self._update_co_baseline_for_current(algo='Manual', manual_override=True)
+            raw_wn = np.asarray(self._current_entry.wavenumber, dtype=float)
+            raw_ab = np.asarray(self._current_entry.absorbance, dtype=float)
+            if len(raw_wn) == 0 or len(raw_ab) == 0:
+                return
+            if self.right_panel.get_baseline_point_mode() == 'free':
+                snapped_point = (float(wn), float(ab))
+            else:
+                nearest = int(np.argmin(np.abs(raw_wn - float(wn))))
+                snapped_point = (float(raw_wn[nearest]), float(raw_ab[nearest]))
+            state = self._total_baseline_states.setdefault(
+                self._current_entry.filepath, {})
+            points = list(state.get('points', []))
+            points = [pt for pt in points if abs(float(pt[0]) - snapped_point[0]) > 1e-9]
+            points.append(snapped_point)
+            state['points'] = points
+            state['manual_override'] = True
+            self._update_total_baseline_for_entries(
+                [self._current_entry], algo='Manual', manual_override=True)
             return
 
-        self._baseline_points.append((wn, ab))
-        self._update_baseline(algo='Manual')
-        self._save_current_spectrum_state(baseline_manual_override=True)
+    def _on_baseline_point_mode_changed(self, _mode: str):
+        if self.right_panel.get_mode() == 'Total' and self._current_entry is not None:
+            self.status_label.setText(
+                "Baseline point mode: "
+                + ("Free" if self.right_panel.get_baseline_point_mode() == 'free'
+                   else "Follow Spectrum")
+            )
 
     def _on_baseline_point_removed(self, idx: int):
-        if self.right_panel.get_mode() == 'CO':
+        mode = self.right_panel.get_mode()
+        if mode == 'Total':
             if self._current_entry is None:
                 return
-            store = self._co_baseline_store(self._current_entry)
-            points = list(store.get('points', []))
+            state = self._total_baseline_states.get(self._current_entry.filepath, {})
+            points = list(state.get('points', []))
             if 0 <= idx < len(points):
                 points.pop(idx)
-            store['points'] = points
-            store['manual_override'] = True
-            self._update_co_baseline_for_current(algo='Manual', manual_override=True)
+            state['points'] = points
+            state['manual_override'] = True
+            self._total_baseline_states[self._current_entry.filepath] = state
+            self._update_total_baseline_for_entries(
+                [self._current_entry], algo='Manual', manual_override=True)
             return
-
-        if 0 <= idx < len(self._baseline_points):
-            self._baseline_points.pop(idx)
-        self._update_baseline(algo='Manual')
-        self._save_current_spectrum_state(baseline_manual_override=True)
 
     def _save_current_spectrum_state(self, baseline_manual_override: bool | None = None):
         if self._current_entry is None or self._wn_crop is None:
@@ -1880,49 +2361,7 @@ class MainWindow(QMainWindow):
     def _update_baseline(self, algo: str = None, params: dict = None):
         if self._current_entry is None:
             return
-        cfg = self.right_panel.get_config()
-        wn, ab = crop_region(
-            self._current_entry.wavenumber,
-            self._current_entry.absorbance,
-            cfg['wn_min'], cfg['wn_max']
-        )
-        self._wn_crop = wn
-        self._ab_crop = ab
-
-        if algo is None:
-            algo = cfg['baseline_algo']
-        if params is None:
-            params = cfg['baseline_params']
-
-        if algo == 'OH Auto Baseline':
-            if len(self._baseline_points) < 2:
-                self._baseline_points = auto_oh_baseline_points(wn, ab)
-            self.plot_widget.restore_baseline_points(self._baseline_points)
-            bl = (baseline_from_points(wn, ab, self._baseline_points)
-                  if len(self._baseline_points) >= 2 else np.zeros_like(ab))
-        elif algo == 'Manual':
-            pts = self._baseline_points
-            bl = baseline_from_points(wn, ab, pts) if len(pts) >= 2 else np.zeros_like(ab)
-        elif algo == 'Rubber Band':
-            bl = baseline_rubberband(wn, ab)
-        elif algo == 'ARPLS':
-            bl = baseline_arpls(ab, lam=params.get('lam', 1e4))
-        elif algo == 'SNIP':
-            bl = baseline_snip(ab, n_iter=params.get('n_iter', 50))
-        elif algo == 'Linear':
-            bl = baseline_linear(wn, ab)
-        else:
-            bl = np.zeros_like(ab)
-
-        self._baseline     = bl
-        self._ab_corrected = subtract_baseline(ab, bl)
-        self.plot_widget.set_corrected_spectrum(wn, self._ab_corrected, bl)
-        self._refresh_selected_overlays(self._capture_plot_view())
-
-        # 피팅 없이도 OH total area 자동 표시 (베이스라인 보정 후 trapz 적분)
-        if self.right_panel.get_mode() == 'OH':
-            total_oh = abs(float(_trapezoid(self._ab_corrected, wn)))
-            self.right_panel.update_oh_total_area(total_oh, self._get_sio_area_for_entry(self._current_entry))
+        self._prepare_oh_analysis_input(self._current_entry)
 
     def _sync_baseline_edit_state_for_current_spectrum(self):
         """스펙트럼 전환 후 Edit Baseline 상태와 auto baseline 적용을 다시 맞춘다."""
@@ -1930,41 +2369,12 @@ class MainWindow(QMainWindow):
         cfg = self.right_panel.get_config()
         algo = cfg['baseline_algo']
         edit_on = self.right_panel.btn_edit_bl.isChecked()
-        is_editable = (mode in ('OH', 'CO') and algo in ('Manual', 'OH Auto Baseline'))
+        is_editable = (mode == 'Total' and algo == 'Manual')
 
         self.plot_widget.set_baseline_edit_mode(edit_on and is_editable)
 
-        if edit_on and mode == 'CO' and algo == 'OH Auto Baseline':
-            if self._current_entry is not None:
-                store = self._co_baseline_store(self._current_entry)
-                if not store.get('manual_override'):
-                    self._update_co_baseline_for_current(
-                        algo=algo,
-                        params=cfg['baseline_params'],
-                    )
-            return
-
-        if not (edit_on and mode == 'OH' and algo == 'OH Auto Baseline'):
-            return
-
-        saved = self._spectrum_states.get(self._current_entry.filepath, {})
-        if saved.get('baseline_manual_override'):
-            return
-
-        expected_wn, _ = crop_region(
-            self._current_entry.wavenumber,
-            self._current_entry.absorbance,
-            cfg['wn_min'], cfg['wn_max']
-        )
-        region_changed = (
-            self._wn_crop is None
-            or len(self._wn_crop) != len(expected_wn)
-            or not np.allclose(self._wn_crop, expected_wn)
-        )
-        if region_changed:
-            self._baseline_points = []
-
-        self._update_baseline(algo=algo, params=cfg['baseline_params'])
+        if edit_on and mode == 'Total':
+            self._restore_total_baseline_points_for_current()
 
     # ── 활성 영역 줌 (Ctrl+A) ────────────────────────────────
 
@@ -1973,7 +2383,41 @@ class MainWindow(QMainWindow):
         mode = self.right_panel.get_mode()
         cfg  = self.right_panel.get_config()
 
-        if mode == 'OH':
+        if mode == 'Total':
+            specs = self._build_total_specs()
+            active_x = []
+            series = []
+            for spec in specs:
+                wn = np.asarray(spec['wn'], dtype=float)
+                ab = np.asarray(spec['ab'], dtype=float)
+                n = min(len(wn), len(ab))
+                if n == 0:
+                    continue
+                wn = wn[:n]
+                display_y = (
+                    ab[:n]
+                    + float(spec.get('base_shift', 0.0))
+                    + float(spec.get('shift', 0.0))
+                )
+                mask = np.isfinite(wn) & np.isfinite(display_y)
+                if not np.any(mask):
+                    continue
+                active_x.append(wn[mask])
+                series.append((wn, display_y))
+
+            if active_x:
+                x_values = np.concatenate(active_x)
+                self.plot_widget.zoom_to(
+                    float(np.min(x_values)),
+                    float(np.max(x_values)),
+                    padding=0.03,
+                )
+                self.plot_widget.fit_y_to_series_in_current_x_range(
+                    series, padding=0.05)
+            else:
+                self.status_label.setText("Total view has no active region")
+
+        elif mode == 'OH':
             wn_min, wn_max = cfg['wn_min'], cfg['wn_max']
             self.plot_widget.zoom_to(wn_min, wn_max, padding=0.05)
             self.plot_widget.fit_y_to_current_x_range()
@@ -2013,12 +2457,62 @@ class MainWindow(QMainWindow):
         amplitude: 피크 높이 (absorbance 단위)
         sigma: Gaussian sigma (cm⁻¹)
         """
+        if self.right_panel.get_mode() == 'CO':
+            self._on_co_peak_created(wn_pos, amplitude, sigma)
+            return
         if self._wn_crop is None:
             return
         self.right_panel.add_peak_guess(wn_pos, amplitude, sigma)
         guesses = self.right_panel.get_guesses()
         self.plot_widget.show_peak_guesses(self._wn_crop, guesses)
         self.status_label.setText(f"Peak added at {wn_pos:.0f} cm⁻¹  |  총 {len(guesses)}개")
+
+    def _on_co_peak_add_mode_toggled(self, checked: bool):
+        self.plot_widget.btn_add_peak.setChecked(checked)
+        if checked:
+            self.status_label.setText(
+                "CO Add Peak Mode  |  plot click or right-drag to create a peak"
+            )
+
+    def _on_co_peak_created(self, wn_pos: float, amplitude: float, sigma: float):
+        if self._current_entry is None:
+            return
+        wn_fit, _, _, ab_fit = self._co_b_fit_data(self._current_entry)
+        if len(wn_fit) < 5:
+            return
+
+        manual = self._ensure_co_manual_state(self._current_entry)
+        guesses = list(manual.get('guesses') or self.right_panel.get_co_guesses())
+        locks = list(manual.get('locks') or self.right_panel.get_co_locks())
+        idx = len(guesses)
+        guess = PeakGuess(
+            center=float(wn_pos),
+            amplitude=max(float(amplitude), 1e-6),
+            sigma=max(float(sigma), 1.0),
+            index=idx,
+            shape=self.right_panel.get_peak_shape_co(),
+        )
+        guess.assignment = 'Unassigned'
+        guesses.append(guess)
+        locks.append({'center': False, 'amplitude': False, 'sigma': False})
+
+        manual['guesses'] = guesses
+        manual['locks'] = locks
+        manual['assignments'] = [self._co_peak_assignment(g) for g in guesses]
+        manual.pop('fit_result', None)
+        manual.pop('raw_fit_result', None)
+        manual['wn'] = wn_fit
+        manual['ab'] = ab_fit
+
+        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
+        for sub in CO_ASSIGNMENT_TARGETS:
+            co_state.setdefault(sub, {})['fit_result'] = None
+
+        self.right_panel.set_co_guesses(guesses, locks=locks)
+        self._on_co_peak_params_changed(self.right_panel.get_co_guesses())
+        self.status_label.setText(
+            f"CO peak added at {wn_pos:.1f} cm⁻¹  |  {len(guesses)} peaks"
+        )
 
     # ── 피크 드래그 ───────────────────────────────────────────
 
@@ -2042,7 +2536,7 @@ class MainWindow(QMainWindow):
                 return
             self._update_co_b_guess(idx, new_amplitude=amplitude)
             self.right_panel.update_co_peak_amplitude(idx, amplitude)
-            self.status_label.setText(f"CO_B P{idx+1} height → {amplitude:.3f}")
+            self.status_label.setText(f"CO P{idx+1} height → {amplitude:.3f}")
             return
         locks = self.right_panel.get_locks()
         if idx < len(locks) and locks[idx].get('amplitude', False):
@@ -2085,34 +2579,33 @@ class MainWindow(QMainWindow):
         self.right_panel.update_co_peak_center(idx, new_center)
         if self._current_entry is not None:
             co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-            co_b_sub = co_state.setdefault('CO_B', {})
+            manual = self._ensure_co_manual_state(self._current_entry)
             locks = self.right_panel.get_co_locks()
             if idx < len(locks):
                 locks[idx]['center'] = True
-            co_b_sub['locks'] = locks
-            co_b_sub['manual_center_locks'] = [
+            manual['locks'] = locks
+            manual['manual_center_locks'] = [
                 i for i, lock in enumerate(locks) if lock.get('center', False)
             ]
-            raw_fit = co_b_sub.get('raw_fit_result')
+            raw_fit = manual.get('fit_result')
             if (
                 target
-                and target.get('type') == 'co_b_fit'
+                and target.get('type') in ('co_b_fit', 'co_peak_fit')
                 and raw_fit is not None
                 and 0 <= idx < len(getattr(raw_fit, 'peaks', []))
             ):
                 raw_fit.peaks[idx].center = float(new_center)
-                self._refresh_co_b_result_from_raw_fit()
+                self._refresh_co_manual_results_from_fit(self._current_entry)
         self.status_label.setText(
-            f"CO_B P{idx + 1} center → {new_center:.1f} cm⁻¹"
+            f"CO P{idx + 1} center → {new_center:.1f} cm⁻¹"
         )
 
     def _update_co_b_guess(self, idx: int, new_center: float = None,
                            new_sigma: float = None, new_amplitude: float = None):
         if self._current_entry is None:
             return
-        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_b_sub = co_state.setdefault('CO_B', {})
-        guesses = co_b_sub.get('guesses', [])
+        manual = self._ensure_co_manual_state(self._current_entry)
+        guesses = manual.get('guesses', [])
         if 0 <= idx < len(guesses):
             if new_center is not None:
                 guesses[idx].center = new_center
@@ -2120,7 +2613,9 @@ class MainWindow(QMainWindow):
                 guesses[idx].sigma = new_sigma
             if new_amplitude is not None:
                 guesses[idx].amplitude = new_amplitude
-            co_b_sub.pop('raw_fit_result', None)
+            manual['assignments'] = [self._co_peak_assignment(g) for g in guesses]
+            manual.pop('fit_result', None)
+            manual.pop('raw_fit_result', None)
 
     def _save_guesses_to_state(self):
         """피크 위치/sigma 수정 시 상태에 저장 — 스펙트럼 전환 후에도 위치 유지"""
@@ -2285,50 +2780,77 @@ class MainWindow(QMainWindow):
     def _co_b_preview_arrays_for_current(self):
         if self._current_entry is None:
             return None
-        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_b = co_state.setdefault('CO_B', {})
-        ep0 = co_b.get('ep0', 1650.0)
-        ep1 = co_b.get('ep1', 1900.0)
-        cfg = self.right_panel.get_config()
-        full_baseline = None
-        if not self._co_uses_endpoint_linear_baseline(cfg.get('baseline_algo')):
-            full_baseline = self._compute_co_full_baseline(
-                self._current_entry,
-                algo=cfg['baseline_algo'],
-                params=cfg['baseline_params'],
-            )
         return (
-            *self._co_subregion_data(
-                self._current_entry, ep0, ep1, full_baseline=full_baseline),
-            full_baseline,
+            *self._co_b_fit_data(self._current_entry),
+            None,
         )
 
     def _on_co_peak_params_changed(self, guesses):
         if self._current_entry is None:
             return
         co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_b_sub = co_state.setdefault('CO_B', {})
-        co_b_sub['guesses'] = list(guesses)
-        co_b_sub['locks'] = self.right_panel.get_co_locks()
-        co_b_sub['manual_center_locks'] = [
-            i for i, lock in enumerate(co_b_sub['locks']) if lock.get('center', False)
+        manual = self._ensure_co_manual_state(self._current_entry)
+        old_guesses = list(manual.get('guesses') or [])
+        old_fit = manual.get('fit_result')
+        manual['guesses'] = list(guesses)
+        manual['locks'] = self.right_panel.get_co_locks()
+        manual['assignments'] = [self._co_peak_assignment(g) for g in guesses]
+        manual['manual_center_locks'] = [
+            i for i, lock in enumerate(manual['locks']) if lock.get('center', False)
         ]
-        co_b_sub.pop('raw_fit_result', None)
+        numeric_changed = len(old_guesses) != len(guesses)
+        if not numeric_changed:
+            for old, new in zip(old_guesses, guesses):
+                if (
+                    abs(float(old.center) - float(new.center)) > 1e-6
+                    or abs(float(old.amplitude) - float(new.amplitude)) > 1e-9
+                    or abs(float(old.sigma) - float(new.sigma)) > 1e-6
+                    or getattr(old, 'shape', '') != getattr(new, 'shape', '')
+                ):
+                    numeric_changed = True
+                    break
+        if numeric_changed:
+            manual.pop('fit_result', None)
+            manual.pop('raw_fit_result', None)
+            for sub in CO_ASSIGNMENT_TARGETS:
+                co_state.setdefault(sub, {})['fit_result'] = None
+        elif old_fit is not None:
+            manual['fit_result'] = old_fit
+            self._refresh_co_manual_results_from_fit(self._current_entry)
+            self.right_panel.update_co_results(
+                co_state.get('CO_L', {}).get('fit_result'),
+                co_state.get('CO_B', {}).get('fit_result'),
+            )
+            wn_fit = manual.get('wn')
+            ab_fit = manual.get('ab')
+            if wn_fit is not None and ab_fit is not None:
+                self.plot_widget.show_fit_result(
+                    np.asarray(wn_fit, dtype=float),
+                    np.asarray(ab_fit, dtype=float),
+                    old_fit,
+                    baseline=None,
+                )
+                self._co_drag_targets = {
+                    i: {'type': 'co_peak_fit', 'peak_idx': i}
+                    for i in range(len(getattr(old_fit, 'peaks', []) or []))
+                }
+                self.plot_widget.set_peak_locks(manual['locks'])
+                return
         preview = self._co_b_preview_arrays_for_current()
         if preview is None:
             return
-        wn_b, _, bl_b, _, full_baseline = preview
+        wn_b, _, _, _, _ = preview
         if len(wn_b) >= 5 and guesses:
             self._co_drag_targets = {
-                i: {'type': 'co_b_guess', 'sub': 'CO_B', 'peak_idx': i}
+                i: {'type': 'co_peak_guess', 'peak_idx': i}
                 for i in range(len(guesses))
             }
             self.plot_widget.show_peak_guesses(
                 wn_b,
                 guesses,
-                baseline=self._co_display_baseline(bl_b, full_baseline),
+                baseline=None,
             )
-            self.plot_widget.set_peak_locks(co_b_sub['locks'])
+            self.plot_widget.set_peak_locks(manual['locks'])
         else:
             self.plot_widget.clear_fit_result()
 
@@ -2336,10 +2858,9 @@ class MainWindow(QMainWindow):
         self.plot_widget.set_peak_locks(locks)
         if self._current_entry is None:
             return
-        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_b_sub = co_state.setdefault('CO_B', {})
-        co_b_sub['locks'] = locks
-        co_b_sub['manual_center_locks'] = [
+        manual = self._ensure_co_manual_state(self._current_entry)
+        manual['locks'] = locks
+        manual['manual_center_locks'] = [
             i for i, lock in enumerate(locks) if lock.get('center', False)
         ]
 
@@ -2347,18 +2868,37 @@ class MainWindow(QMainWindow):
         if self._current_entry is None:
             return
         co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_b_sub = co_state.setdefault('CO_B', {})
-        for key in ('guesses', 'locks', 'manual_center_locks', 'raw_fit_result',
+        manual = self._ensure_co_manual_state(self._current_entry)
+        for key in ('guesses', 'locks', 'assignments', 'manual_center_locks',
+                    'fit_result', 'raw_fit_result', 'wn', 'ab', 'baseline',
                     'wn_b', 'ab_pos_b', 'baseline_b'):
-            co_b_sub.pop(key, None)
+            manual.pop(key, None)
+        legacy_co_b = co_state.get('CO_B', {})
+        if isinstance(legacy_co_b, dict):
+            for key in ('guesses', 'locks', 'manual_center_locks',
+                        'raw_fit_result', 'wn_b', 'ab_pos_b', 'baseline_b'):
+                legacy_co_b.pop(key, None)
+        for sub in CO_ASSIGNMENT_TARGETS:
+            co_state.setdefault(sub, {})['fit_result'] = None
+            co_state.setdefault(sub, {})['status'] = 'review'
         self._co_drag_targets = {}
         self.plot_widget.clear_fit_result()
+        self.right_panel.update_co_results(None, None)
+        self._co_fit_records = [
+            record for record in self._co_fit_records
+            if record.get('filename') != self._current_entry.name
+        ]
+        self.analysis_widget.update_co_plots(
+            self._visible_co_fit_records(),
+            self._visible_potentials(),
+        )
+        self._refresh_co_stark_results(self._visible_potentials())
         self._apply_co_view(self._current_entry)
-        self.status_label.setText("CO_B peaks cleared")
+        self.status_label.setText("CO peaks cleared")
 
     def _on_co_peak_rows_deleted(self, guesses):
         self._on_co_peak_params_changed(guesses)
-        self.status_label.setText(f"CO_B peak removed  |  {len(guesses)} peaks remain")
+        self.status_label.setText(f"CO peak removed  |  {len(guesses)} peaks remain")
 
     # ── Split View ────────────────────────────────────────────
 
@@ -2655,6 +3195,32 @@ class MainWindow(QMainWindow):
             if filepath in visible_paths
         }
 
+    def _visible_export_spectrum_states(self, prefer_total: bool = False) -> dict:
+        states = {
+            filepath: copy.deepcopy(state)
+            for filepath, state in self._visible_spectrum_states().items()
+        }
+        if not prefer_total:
+            return states
+
+        visible_paths = {entry.filepath for entry in self.spectrum_list.get_visible_entries()}
+        for filepath, state in self._total_baseline_states.items():
+            if filepath not in visible_paths:
+                continue
+            states[filepath] = {
+                'wn_crop': np.asarray(state.get('wn', []), dtype=float),
+                'ab_crop': np.asarray(state.get('raw', []), dtype=float),
+                'baseline': np.asarray(state.get('baseline', []), dtype=float),
+                'ab_corrected': np.asarray(state.get('corrected', []), dtype=float),
+                'fit_result': None,
+                'guesses': [],
+                'locks': [],
+                'baseline_points': list(state.get('points', [])),
+                'baseline_manual_override': bool(state.get('manual_override', False)),
+                'snapshots': [],
+            }
+        return states
+
     def _visible_co_states(self) -> dict:
         visible_paths = {entry.filepath for entry in self.spectrum_list.get_visible_entries()}
         return {
@@ -2675,6 +3241,7 @@ class MainWindow(QMainWindow):
         entries = self.spectrum_list.get_visible_entries()
         potentials = self.spectrum_list.get_potentials(visible_only=True)
         spectrum_states = self._visible_spectrum_states()
+        export_spectrum_states = self._visible_export_spectrum_states(prefer_total=True)
         co_states = self._visible_co_states()
         fit_records = self._visible_fit_records()
         co_fit_records = self._visible_co_fit_records()
@@ -2683,10 +3250,18 @@ class MainWindow(QMainWindow):
             1 for s in spectrum_states.values()
             if s.get('fit_result') and s['fit_result'].success
         )
+        oh_processed_count = sum(
+            1 for s in export_spectrum_states.values()
+            if s.get('wn_crop') is not None
+            and (
+                s.get('baseline') is not None
+                or s.get('ab_corrected') is not None
+            )
+        )
         co_count = len(co_fit_records)
 
-        if fitted_count == 0 and co_count == 0:
-            QMessageBox.warning(self, "No result", "현재 세션에 내보낼 피팅 결과가 없습니다.")
+        if fitted_count == 0 and oh_processed_count == 0 and co_count == 0:
+            QMessageBox.warning(self, "No result", "현재 세션에 내보낼 결과 또는 스펙트럼 상태가 없습니다.")
             return
 
         fp, _ = QFileDialog.getSaveFileName(
@@ -2698,7 +3273,19 @@ class MainWindow(QMainWindow):
 
         saved_files = []
         try:
-            if fitted_count > 1:
+            if fitted_count == 0 and oh_processed_count > 0:
+                export_info = export_spectra_excel(
+                    entries,
+                    potentials,
+                    fp,
+                    spectrum_states=export_spectrum_states,
+                    co_states=co_states,
+                )
+                saved_files.append(
+                    f"{export_info['n_spectra']}개 스펙트럼"
+                    f" / OH {export_info.get('oh_points', 0)} pts: {Path(fp).name}"
+                )
+            elif fitted_count > 1:
                 stark = calculate_stark_slopes(
                     fit_records,
                     potentials=potentials if potentials else None,
@@ -2766,7 +3353,7 @@ class MainWindow(QMainWindow):
                 entries,
                 self.spectrum_list.get_potentials(visible_only=True),
                 fp,
-                spectrum_states=self._visible_spectrum_states(),
+                spectrum_states=self._visible_export_spectrum_states(prefer_total=True),
                 co_states=self._visible_co_states(),
             )
             layout_label = "matrix" if export_info['layout'] == 'matrix' else "long-format"
@@ -2932,57 +3519,10 @@ class MainWindow(QMainWindow):
                 guesses.append(PeakGuess(center=center, amplitude=amp,
                                          sigma=sigma, index=i))
 
-            # 베이스라인 보정
-            wn, ab = crop_region(entry.wavenumber, entry.absorbance,
-                                  cfg['wn_min'], cfg['wn_max'])
-            algo   = cfg['baseline_algo']
-            params = cfg['baseline_params']
-
-            if algo == 'OH Auto Baseline':
-                saved = self._spectrum_states.get(entry.filepath)
-                if saved and saved.get('baseline_points'):
-                    wn = saved['wn_crop']
-                    ab = saved['ab_crop']
-                    bl = saved['baseline']
-                    ab_cor = saved['ab_corrected']
-                    baseline_points = list(saved.get('baseline_points', []))
-                else:
-                    baseline_points = auto_oh_baseline_points(wn, ab)
-                    bl = baseline_from_points(wn, ab, baseline_points)
-                    ab_cor = subtract_baseline(ab, bl)
-            elif algo == 'Manual':
-                # Manual 모드: 저장된 베이스라인이 있으면 재사용, 없으면 zero
-                saved = self._spectrum_states.get(entry.filepath)
-                if saved:
-                    wn     = saved['wn_crop']
-                    ab     = saved['ab_crop']
-                    bl     = saved['baseline']
-                    ab_cor = saved['ab_corrected']
-                    baseline_points = list(saved.get('baseline_points', []))
-                else:
-                    bl     = np.zeros_like(ab)
-                    ab_cor = ab.copy()
-                    baseline_points = []
-            elif algo == 'Rubber Band':
-                bl     = baseline_rubberband(wn, ab)
-                ab_cor = subtract_baseline(ab, bl)
-                baseline_points = []
-            elif algo == 'ARPLS':
-                bl     = baseline_arpls(ab, lam=params.get('lam', 1e4))
-                ab_cor = subtract_baseline(ab, bl)
-                baseline_points = []
-            elif algo == 'SNIP':
-                bl     = baseline_snip(ab, n_iter=params.get('n_iter', 50))
-                ab_cor = subtract_baseline(ab, bl)
-                baseline_points = []
-            elif algo == 'Linear':
-                bl     = baseline_linear(wn, ab)
-                ab_cor = subtract_baseline(ab, bl)
-                baseline_points = []
-            else:
-                bl     = np.zeros_like(ab)
-                ab_cor = ab.copy()
-                baseline_points = []
+            # Total에서 만든 corrected spectrum을 우선 사용하고, 없으면 raw.
+            wn, ab, bl, ab_cor, _ = self._analysis_arrays_for_entry(
+                entry, cfg['wn_min'], cfg['wn_max'])
+            baseline_points = []
 
             ab_pos = np.maximum(ab_cor, 0)
 
@@ -3201,6 +3741,7 @@ class MainWindow(QMainWindow):
             self.batch_results     = []
             self._fit_records      = []
             self._spectrum_states  = {}
+            self._total_baseline_states = {}
             self._co_states        = {}
             self._sio_states       = {}
             self._co_fit_records   = []
@@ -3210,6 +3751,7 @@ class MainWindow(QMainWindow):
             self._sio_ref_area     = None
             self._total_shifts     = {}
             self._total_view_mode  = 'overlay'
+            self._total_inactive_ranges = {}
             self.right_panel.set_total_view_mode(self._total_view_mode)
             self.right_panel.clear_current_summary()
             self.right_panel.clear_stark_results()
@@ -3247,6 +3789,21 @@ class MainWindow(QMainWindow):
     def _build_session_payload(self, entries: list[SpectrumEntry]) -> dict:
         entry_names = {entry.name for entry in entries}
         entry_paths = {entry.filepath for entry in entries}
+        entry_session_keys = {
+            self.spectrum_list.get_session_key_for_entry(entry)
+            for entry in entries
+        }
+        session_order = [
+            key for key in self.spectrum_list.get_session_keys()
+            if key in entry_session_keys
+        ]
+        workspace_sessions = [
+            {
+                'key': key,
+                'label': self.spectrum_list.get_session_label_for_key(key),
+            }
+            for key in session_order
+        ]
         potentials_all = self.spectrum_list.get_potentials()
         potentials = {
             name: potential
@@ -3289,11 +3846,14 @@ class MainWindow(QMainWindow):
         )
 
         return {
+            'workspace_sessions': workspace_sessions,
+            'session_order': session_order,
             'spectra': [
                 {
                     'filepath':   e.filepath,
                     'name':       e.name,
                     'original_name': e.original_name or e.name,
+                    'session_key': self.spectrum_list.get_session_key_for_entry(e),
                     'source_session_label': e.source_session_label,
                     'source_session_path': e.source_session_path,
                     'source_spectrum_path': e.source_spectrum_path or e.filepath,
@@ -3307,6 +3867,11 @@ class MainWindow(QMainWindow):
             'spectrum_states': {
                 fp: copy.deepcopy(state)
                 for fp, state in self._spectrum_states.items()
+                if fp in entry_paths
+            },
+            'total_baseline_states': {
+                fp: copy.deepcopy(state)
+                for fp, state in self._total_baseline_states.items()
                 if fp in entry_paths
             },
             'fit_records':     fit_records,
@@ -3327,6 +3892,11 @@ class MainWindow(QMainWindow):
             'sio_ref_area':    self._sio_ref_area,
             'total_shifts':    total_shifts,
             'total_view_mode': self._total_view_mode,
+            'total_inactive_ranges': {
+                session_key: list(ranges)
+                for session_key, ranges in self._total_inactive_ranges.items()
+                if session_key in entry_session_keys
+            },
         }
 
     def _save_entries(self, entries: list[SpectrumEntry], title: str,
@@ -3401,6 +3971,7 @@ class MainWindow(QMainWindow):
         try:
             removed = self.spectrum_list.remove_session(session_key)
             self._total_shifts.pop(session_key, None)
+            self._total_inactive_ranges.pop(session_key, None)
         finally:
             self._loading_session = False
 
@@ -3438,6 +4009,7 @@ class MainWindow(QMainWindow):
         self.spectrum_list.clear_all()
         self.right_panel.clear_stark_results()
         self._spectrum_states  = {}
+        self._total_baseline_states = {}
         self._fit_records      = []
         self._co_states        = {}
         self._co_fit_records   = []
@@ -3447,6 +4019,7 @@ class MainWindow(QMainWindow):
         self._sio_ref_area     = None
         self._total_shifts     = {}
         self._total_view_mode  = 'overlay'
+        self._total_inactive_ranges = {}
         self._current_entry    = None
         self.plot_widget.reset_view()
 
@@ -3455,6 +4028,12 @@ class MainWindow(QMainWindow):
         self.spectrum_list.begin_bulk_update()
         try:
             for s in spectra_data:
+                saved_session_key = self._saved_session_key_for_spectrum(s)
+                source_session_label = (
+                    ""
+                    if saved_session_key == self.spectrum_list.LOOSE_FILES_KEY
+                    else str(s.get('source_session_label') or saved_session_key)
+                )
                 entry = SpectrumEntry(
                     filepath=s['filepath'],
                     name=s['name'],
@@ -3463,7 +4042,7 @@ class MainWindow(QMainWindow):
                     color=s['color'],
                     fit_done=s.get('fit_done', False),
                     original_name=s.get('original_name', s['name']),
-                    source_session_label=s.get('source_session_label', ''),
+                    source_session_label=source_session_label,
                     source_session_path=s.get('source_session_path', ''),
                     source_spectrum_path=s.get('source_spectrum_path', s['filepath']),
                 )
@@ -3478,6 +4057,8 @@ class MainWindow(QMainWindow):
 
         # OH 분석 상태 복원
         self._spectrum_states = data.get('spectrum_states', {})
+        self._total_baseline_states = self._sanitize_total_baseline_states(
+            data.get('total_baseline_states', {}))
         self._fit_records     = data.get('fit_records', [])
 
         # CO / Si-O 상태 복원
@@ -3489,6 +4070,11 @@ class MainWindow(QMainWindow):
         self._sio_ref_area   = data.get('sio_ref_area', None)
         self._total_shifts   = self._normalize_total_shifts(data.get('total_shifts', {}))
         self._total_view_mode = data.get('total_view_mode', 'overlay')
+        self._total_inactive_ranges = {
+            str(session_key): self._merge_total_ranges(ranges)
+            for session_key, ranges in data.get('total_inactive_ranges', {}).items()
+            if isinstance(ranges, (list, tuple))
+        }
         self.right_panel.set_total_view_mode(self._total_view_mode)
 
         # Potential 테이블 복원 (저장된 값 그대로)
@@ -3543,6 +4129,9 @@ class MainWindow(QMainWindow):
 
     def _on_mode_changed(self, mode: str):
         self.plot_widget.clear_analysis_region()
+        self.plot_widget.set_baseline_edit_mode(False)
+        self.plot_widget.clear_baseline_points()
+        self.plot_widget.cb_baseline.setVisible(mode == 'Total')
 
         if mode == 'Total':
             self.plot_widget.clear_endpoint_items()
@@ -3575,10 +4164,20 @@ class MainWindow(QMainWindow):
             self.plot_widget.zoom_to(wn_min, wn_max)
 
             if self._current_entry is not None:
-                # 항상 baseline 재계산 → corrected spectrum + wn_crop 갱신
-                self._update_baseline()
-                # 저장된 피팅 결과 복원
                 saved = self._spectrum_states.get(self._current_entry.filepath)
+                if saved and saved.get('wn_crop') is not None and saved.get('ab_corrected') is not None:
+                    self._wn_crop = np.asarray(saved['wn_crop'], dtype=float)
+                    self._ab_crop = np.asarray(saved.get('ab_crop', saved['ab_corrected']), dtype=float)
+                    self._baseline = np.asarray(
+                        saved.get('baseline', np.zeros_like(self._wn_crop)), dtype=float)
+                    self._ab_corrected = np.asarray(saved['ab_corrected'], dtype=float)
+                    self._fit_result = saved.get('fit_result')
+                    self._baseline_points = list(saved.get('baseline_points', []))
+                    self.plot_widget.show_highlighted_region(
+                        self._wn_crop, self._ab_corrected)
+                else:
+                    self._update_baseline()
+
                 if saved and saved.get('fit_result') is not None:
                     ab_pos = np.maximum(saved['ab_corrected'], 0)
                     self.plot_widget.show_fit_result(
@@ -3591,8 +4190,12 @@ class MainWindow(QMainWindow):
                     self.right_panel.set_guesses(saved['guesses'], locks=saved.get('locks', []))
 
         elif mode == 'CO':
+            self._sync_co_b_mode_from_saved_state()
             self._apply_co_view(self._current_entry)
-            self._analyze_all_co(auto_triggered=True)
+            if self._should_auto_analyze_co_on_mode_entry():
+                self._analyze_all_co(auto_triggered=True)
+            else:
+                self._refresh_co_analysis_from_saved_state()
 
         elif mode == 'SiO':
             self._apply_sio_view(self._current_entry)
@@ -3629,6 +4232,168 @@ class MainWindow(QMainWindow):
         if result and result.success and result.peaks:
             return float(getattr(result.peaks[0], 'area', 0.0))
         return 0.0
+
+    def _co_peak_assignment(self, guess, default: str = 'Unassigned') -> str:
+        value = getattr(guess, 'assignment', default)
+        if value in ('CO_L', 'CO_B', 'OH bending', 'Other'):
+            return value
+        return default
+
+    def _ensure_co_manual_state(self, entry: SpectrumEntry) -> dict:
+        """Return the manual CO fit state, migrating legacy CO_B deconv data."""
+        co_state = self._co_states.setdefault(entry.filepath, {})
+        manual = co_state.setdefault('manual_fit', {})
+        legacy = co_state.get('CO_B', {})
+
+        if not manual.get('guesses') and legacy.get('guesses'):
+            manual['guesses'] = copy.deepcopy(legacy.get('guesses') or [])
+        if not manual.get('locks') and legacy.get('locks'):
+            manual['locks'] = copy.deepcopy(legacy.get('locks') or [])
+        if manual.get('fit_result') is None and legacy.get('raw_fit_result') is not None:
+            manual['fit_result'] = legacy.get('raw_fit_result')
+        if manual.get('wn') is None and legacy.get('wn_b') is not None:
+            manual['wn'] = legacy.get('wn_b')
+        if manual.get('ab') is None and legacy.get('ab_pos_b') is not None:
+            manual['ab'] = legacy.get('ab_pos_b')
+        if manual.get('baseline') is None and legacy.get('baseline_b') is not None:
+            manual['baseline'] = legacy.get('baseline_b')
+
+        guesses = manual.get('guesses') or []
+        assignments = list(manual.get('assignments') or [])
+        if len(assignments) != len(guesses):
+            assignments = [self._co_peak_assignment(g) for g in guesses]
+            manual['assignments'] = assignments
+        for guess, assignment in zip(guesses, assignments):
+            setattr(guess, 'assignment', assignment)
+        return manual
+
+    def _assigned_co_results_from_fit(self, fit_result, assignments: list,
+                                      wn_fit: np.ndarray) -> dict:
+        results = {label: None for label in CO_ASSIGNMENT_TARGETS}
+        if fit_result is None or not getattr(fit_result, 'success', False):
+            return results
+
+        candidates = {label: [] for label in CO_ASSIGNMENT_TARGETS}
+        for idx, peak in enumerate(getattr(fit_result, 'peaks', []) or []):
+            assignment = assignments[idx] if idx < len(assignments) else 'Unassigned'
+            if assignment not in candidates:
+                continue
+            curve = None
+            if getattr(fit_result, 'individual_curves', None) and idx < len(fit_result.individual_curves):
+                curve = fit_result.individual_curves[idx]
+            if curve is not None and len(curve) == len(wn_fit):
+                area = abs(float(_trapezoid(curve, wn_fit)))
+            else:
+                area = float(getattr(peak, 'area', 0.0))
+            candidates[assignment].append((area, float(peak.center)))
+
+        for assignment, peaks in candidates.items():
+            if peaks:
+                area, center = max(peaks, key=lambda item: item[0])
+                results[assignment] = _make_co_result(center, area)
+        return results
+
+    def _refresh_co_manual_results_from_fit(self, entry: SpectrumEntry | None = None):
+        entry = entry or self._current_entry
+        if entry is None:
+            return
+        co_state = self._co_states.setdefault(entry.filepath, {})
+        manual = self._ensure_co_manual_state(entry)
+        fit_result = manual.get('fit_result')
+        wn_fit = manual.get('wn')
+        if fit_result is None or wn_fit is None:
+            assigned = {label: None for label in CO_ASSIGNMENT_TARGETS}
+        else:
+            assigned = self._assigned_co_results_from_fit(
+                fit_result,
+                list(manual.get('assignments') or []),
+                np.asarray(wn_fit, dtype=float),
+            )
+        missing_assignment = any(assigned[label] is None for label in CO_ASSIGNMENT_TARGETS)
+        for sub in CO_ASSIGNMENT_TARGETS:
+            sub_state = co_state.setdefault(sub, {})
+            sub_state['fit_result'] = assigned.get(sub)
+            sub_state['status'] = 'review' if missing_assignment else 'ok'
+            sub_state['analysis_mode'] = 'manual_fit'
+        self._update_co_fit_record_for_entry(entry)
+
+    def _co_b_state_is_deconv(self, co_b_state: dict) -> bool:
+        if not isinstance(co_b_state, dict):
+            return False
+        return (
+            co_b_state.get('analysis_mode') == 'deconv'
+            or co_b_state.get('raw_fit_result') is not None
+            or bool(co_b_state.get('guesses'))
+        )
+
+    def _co_state_has_fit(self, co_state: dict) -> bool:
+        if not isinstance(co_state, dict):
+            return False
+        return any(
+            co_state.get(sub, {}).get('fit_result') is not None
+            for sub in ('CO_L', 'CO_B')
+        )
+
+    def _co_fit_records_for_entries(self, entries: list[SpectrumEntry]) -> list:
+        names = {entry.name for entry in entries}
+        return [
+            record for record in self._co_fit_records
+            if record.get('filename') in names
+        ]
+
+    def _sync_co_b_mode_from_saved_state(self):
+        entries = self.spectrum_list.get_visible_entries()
+        if not entries and self._current_entry is not None:
+            entries = [self._current_entry]
+
+        if self._current_entry is not None:
+            current_state = self._co_states.get(self._current_entry.filepath, {})
+            current_co_b = current_state.get('CO_B', {})
+            if self._co_b_state_is_deconv(current_co_b):
+                self.right_panel.set_co_b_fit_mode('auto')
+                return
+            if self._co_state_has_fit(current_state):
+                self.right_panel.set_co_b_fit_mode('simple_only')
+                return
+
+        has_deconv = False
+        has_simple = False
+        for entry in entries:
+            co_state = self._co_states.get(entry.filepath, {})
+            co_b_state = co_state.get('CO_B', {})
+            if self._co_b_state_is_deconv(co_b_state):
+                has_deconv = True
+            elif self._co_state_has_fit(co_state):
+                has_simple = True
+
+        if has_deconv:
+            self.right_panel.set_co_b_fit_mode('auto')
+        elif has_simple:
+            self.right_panel.set_co_b_fit_mode('simple_only')
+        else:
+            self.right_panel.set_co_b_fit_mode('auto')
+
+    def _should_auto_analyze_co_on_mode_entry(self) -> bool:
+        entries = self.spectrum_list.get_visible_entries()
+        if not entries:
+            return False
+        if self._co_fit_records_for_entries(entries):
+            return False
+        return not any(
+            self._co_state_has_fit(self._co_states.get(entry.filepath, {}))
+            for entry in entries
+        )
+
+    def _refresh_co_analysis_from_saved_state(self):
+        if self._co_fit_records:
+            self.analysis_widget.update_co_plots(
+                self._visible_co_fit_records(),
+                self._visible_potentials(),
+            )
+            self._refresh_co_stark_results(self._visible_potentials())
+        else:
+            self.right_panel.update_co_stark_results([])
+        self.status_label.setText("CO saved analysis restored")
 
     def _update_co_fit_record_for_entry(self, entry: SpectrumEntry):
         co_state = self._co_states.get(entry.filepath, {})
@@ -3672,45 +4437,8 @@ class MainWindow(QMainWindow):
     def _refresh_co_b_result_from_raw_fit(self):
         if self._current_entry is None:
             return
-        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_b_sub = co_state.setdefault('CO_B', {})
-        raw_fit = co_b_sub.get('raw_fit_result')
-        if raw_fit is None or not getattr(raw_fit, 'success', False) or not raw_fit.peaks:
-            return
-        co_b_i = max(range(len(raw_fit.peaks)), key=lambda i: raw_fit.peaks[i].center)
-        wn_b = co_b_sub.get('wn_b')
-        if (
-            wn_b is not None
-            and getattr(raw_fit, 'individual_curves', None)
-            and co_b_i < len(raw_fit.individual_curves)
-            and len(raw_fit.individual_curves[co_b_i]) == len(wn_b)
-        ):
-            area = abs(float(_trapezoid(raw_fit.individual_curves[co_b_i], wn_b)))
-        else:
-            area = float(getattr(raw_fit.peaks[co_b_i], 'area', 0.0))
-        co_b_sub['fit_result'] = _make_co_result(raw_fit.peaks[co_b_i].center, area)
+        self._refresh_co_manual_results_from_fit(self._current_entry)
         self._refresh_co_outputs_after_manual_edit()
-
-    def _get_co_endpoints_for_entry(self, entry: SpectrumEntry, prefer_plot: bool = False) -> dict:
-        if prefer_plot and self._current_entry is not None and entry.filepath == self._current_entry.filepath:
-            eps = self.plot_widget.get_co_endpoints()
-            if eps:
-                return {
-                    'CO_L': tuple(sorted(eps.get('CO_L', (2000.0, 2100.0)))),
-                    'CO_B': tuple(sorted(eps.get('CO_B', (1650.0, 1900.0)))),
-                }
-
-        co_state = self._co_states.setdefault(entry.filepath, {})
-        auto_eps = auto_co_baseline_endpoints(entry.wavenumber, entry.absorbance)
-        endpoints = {}
-        for sub, default_eps in [('CO_L', (2000.0, 2100.0)), ('CO_B', (1650.0, 1900.0))]:
-            ep0, ep1 = auto_eps.get(sub, default_eps)
-            sub_state = co_state.setdefault(sub, {})
-            if sub_state.get('manual_override', False):
-                ep0 = sub_state.get('ep0', ep0)
-                ep1 = sub_state.get('ep1', ep1)
-            endpoints[sub] = tuple(sorted((ep0, ep1)))
-        return endpoints
 
     def _should_use_co_b_deconv(self, wn_b: np.ndarray, ab_pos_b: np.ndarray) -> bool:
         fit_mode = self.right_panel.get_co_b_fit_mode()
@@ -3746,250 +4474,109 @@ class MainWindow(QMainWindow):
             and area_ratio >= 32.0
         )
 
-    def _co_uses_endpoint_linear_baseline(self, algo: str | None = None) -> bool:
-        if algo is None:
-            algo = self.right_panel.get_config().get('baseline_algo', 'Linear')
-        return algo == 'Linear'
-
-    def _co_baseline_store(self, entry: SpectrumEntry) -> dict:
-        co_state = self._co_states.setdefault(entry.filepath, {})
-        return co_state.setdefault('_baseline', {})
-
-    def _compute_co_full_baseline(self, entry: SpectrumEntry, algo: str | None = None,
-                                  params: dict | None = None, restore_points: bool = False,
-                                  manual_override: bool | None = None):
-        cfg = self.right_panel.get_config()
-        if algo is None:
-            algo = cfg['baseline_algo']
-        if params is None:
-            params = cfg['baseline_params']
-
-        wn, ab = crop_region(entry.wavenumber, entry.absorbance,
-                             cfg['wn_min'], cfg['wn_max'])
-        store = self._co_baseline_store(entry)
-        points = [
-            pt for pt in store.get('points', [])
-            if min(cfg['wn_min'], cfg['wn_max']) <= pt[0] <= max(cfg['wn_min'], cfg['wn_max'])
-        ]
-        if manual_override is None:
-            manual_override = bool(store.get('manual_override', False))
-
-        if len(wn) == 0:
-            bl = np.zeros_like(ab)
-        elif algo == 'OH Auto Baseline':
-            if manual_override and len(points) >= 2:
-                pass
-            else:
-                points = auto_oh_baseline_points(wn, ab)
-                manual_override = False
-            bl = baseline_from_points(wn, ab, points) if len(points) >= 2 else np.zeros_like(ab)
-        elif algo == 'Manual':
-            bl = baseline_from_points(wn, ab, points) if len(points) >= 2 else np.zeros_like(ab)
-            manual_override = True
-        elif algo == 'Rubber Band':
-            points = []
-            bl = baseline_rubberband(wn, ab)
-            manual_override = False
-        elif algo == 'ARPLS':
-            points = []
-            bl = baseline_arpls(ab, lam=params.get('lam', 1e4))
-            manual_override = False
-        elif algo == 'SNIP':
-            points = []
-            bl = baseline_snip(ab, n_iter=params.get('n_iter', 50))
-            manual_override = False
-        else:
-            points = []
-            bl = baseline_linear(wn, ab) if len(wn) else np.zeros_like(ab)
-            manual_override = False
-
-        corrected = subtract_baseline(ab, bl)
-        store.update({
-            'wn': wn.copy(),
-            'ab': ab.copy(),
-            'baseline': bl.copy(),
-            'ab_corrected': corrected.copy(),
-            'points': list(points),
-            'algo': algo,
-            'params': dict(params),
-            'manual_override': bool(manual_override),
-        })
-        if restore_points and points:
-            self.plot_widget.restore_baseline_points(points)
-        return wn, ab, bl, corrected, points
-
-    def _co_subregion_data(self, entry: SpectrumEntry, ep0: float, ep1: float,
-                           full_baseline=None):
+    def _co_subregion_data(self, entry: SpectrumEntry, ep0: float, ep1: float):
         ep0, ep1 = sorted((ep0, ep1))
-        wn_sub, ab_sub = crop_region(entry.wavenumber, entry.absorbance, ep0, ep1)
+        wn_sub, ab_sub, _, corrected, _ = self._analysis_arrays_for_entry(
+            entry, ep0, ep1)
         if len(wn_sub) == 0:
             return wn_sub, ab_sub, np.zeros_like(ab_sub), np.zeros_like(ab_sub)
+        return wn_sub, ab_sub, np.zeros_like(corrected), np.maximum(corrected, 0)
 
-        if full_baseline is not None:
-            wn_full, _, bl_full, _, _ = full_baseline
-            if len(wn_full) and len(bl_full) == len(wn_full):
-                order = np.argsort(wn_full)
-                bl_sub = np.interp(wn_sub, np.asarray(wn_full)[order], np.asarray(bl_full)[order])
-            else:
-                bl_sub = np.zeros_like(ab_sub)
-        else:
-            y0 = float(np.interp(ep0, entry.wavenumber, entry.absorbance))
-            y1 = float(np.interp(ep1, entry.wavenumber, entry.absorbance))
-            bl_sub = np.interp(wn_sub, [ep0, ep1], [y0, y1])
-        return wn_sub, ab_sub, bl_sub, np.maximum(ab_sub - bl_sub, 0)
+    def _co_display_region_for_entry(self, entry: SpectrumEntry | None):
+        if entry is None:
+            return CO_DISPLAY_REGION
+        wn, _ = self._total_display_data_for_entry(entry)
+        wn = np.asarray(wn, dtype=float)
+        finite = wn[np.isfinite(wn)]
+        if len(finite) == 0:
+            return CO_DISPLAY_REGION
+        return float(np.min(finite)), float(np.max(finite))
 
-    def _co_display_baseline(self, baseline, full_baseline):
-        """CO fit graphics use raw baseline only when the plot is still raw."""
-        return None if full_baseline is not None else baseline
-
-    def _update_co_baseline_for_current(self, algo: str | None = None,
-                                        params: dict | None = None,
-                                        manual_override: bool | None = None):
-        if self._current_entry is None:
-            return
-        if self._co_uses_endpoint_linear_baseline(algo):
-            self.plot_widget.clear_baseline_curve()
-            self._apply_co_view(self._current_entry, preserve_view=True)
-            return
-        self._compute_co_full_baseline(
-            self._current_entry,
-            algo=algo,
-            params=params,
-            restore_points=True,
-            manual_override=manual_override,
-        )
-        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        co_state.setdefault('CO_B', {}).pop('raw_fit_result', None)
-        self._apply_co_view(self._current_entry, preserve_view=True)
+    def _co_b_fit_data(self, entry: SpectrumEntry):
+        ep0, ep1 = self._co_display_region_for_entry(entry)
+        return self._co_subregion_data(entry, ep0, ep1)
 
     def _fit_co_entry(self, entry: SpectrumEntry, prefer_plot_eps: bool = False,
                       refresh_plot: bool = False) -> dict:
-        cfg = self.right_panel.get_config()
-        full_baseline = None
-        if not self._co_uses_endpoint_linear_baseline(cfg.get('baseline_algo')):
-            full_baseline = self._compute_co_full_baseline(
-                entry,
-                algo=cfg['baseline_algo'],
-                params=cfg['baseline_params'],
-            )
-        eps = self._get_co_endpoints_for_entry(entry, prefer_plot=prefer_plot_eps)
-
-        results = {}
         co_state = self._co_states.setdefault(entry.filepath, {})
+        manual = self._ensure_co_manual_state(entry)
+        results = {label: None for label in CO_ASSIGNMENT_TARGETS}
+        needs_review = True
+        wn_b, _, bl_b, ab_pos_b = self._co_b_fit_data(entry)
+        guesses = list(manual.get('guesses') or [])
 
-        ep0_l, ep1_l = eps['CO_L']
-        wn_l, _, _, ab_pos_l = self._co_subregion_data(
-            entry, ep0_l, ep1_l, full_baseline=full_baseline)
-        if len(wn_l) >= 3:
-            peak_idx_l = int(np.argmax(ab_pos_l))
-            center_l = self._manual_co_center(co_state, 'CO_L', ep0_l, ep1_l)
-            if center_l is None:
-                center_l = float(wn_l[peak_idx_l])
-            results['CO_L'] = _make_co_result(
-                center_l,
-                abs(float(_trapezoid(ab_pos_l, wn_l)))
-            )
-        else:
-            results['CO_L'] = None
-
-        used_deconv = False
-        needs_review = False
-        ep0_b, ep1_b = eps['CO_B']
-        wn_b, _, bl_b, ab_pos_b = self._co_subregion_data(
-            entry, ep0_b, ep1_b, full_baseline=full_baseline)
         if len(wn_b) >= 5:
-            used_deconv = self._should_use_co_b_deconv(wn_b, ab_pos_b)
-            co_b_sub = co_state.setdefault('CO_B', {})
+            if guesses:
+                shape = self.right_panel.get_peak_shape_co()
+                assignments = [self._co_peak_assignment(g) for g in guesses]
+                locks = list(manual.get('locks') or [])
+                if len(locks) != len(guesses):
+                    manual_locks = set(
+                        int(i) for i in manual.get('manual_center_locks', [])
+                    )
+                    locks = [
+                        {'center': i in manual_locks,
+                         'amplitude': False,
+                         'sigma': False}
+                        for i in range(len(guesses))
+                    ]
 
-            if used_deconv:
-                guesses = co_b_sub.get('guesses')
-                if guesses and any(not (ep0_b <= g.center <= ep1_b) for g in guesses):
-                    guesses = None
-                if not guesses:
-                    guesses = find_peaks_second_derivative(wn_b, ab_pos_b, n_peaks=2)
-
-                if guesses:
-                    shape = self.right_panel.get_peak_shape_co()
-                    locks = list(co_b_sub.get('locks') or [])
-                    if not locks:
-                        manual_locks = set(
-                            int(i) for i in co_b_sub.get('manual_center_locks', [])
+                fit_result = fit_peaks(wn_b, ab_pos_b, guesses, shape=shape,
+                                       center_tolerance=80.0, locks=locks)
+                if fit_result.success and fit_result.peaks:
+                    fitted_guesses = []
+                    for i, p in enumerate(fit_result.peaks):
+                        amplitude = (
+                            float(np.max(fit_result.individual_curves[i]))
+                            if i < len(fit_result.individual_curves)
+                            else float(getattr(p, 'amplitude', 0.0))
                         )
-                        locks = [
-                            {'center': i in manual_locks,
-                             'amplitude': False,
-                             'sigma': False}
-                            for i in range(len(guesses))
-                        ]
-                    fit_result = fit_peaks(wn_b, ab_pos_b, guesses, shape=shape,
-                                           center_tolerance=80.0, locks=locks)
-                    if fit_result.success and fit_result.peaks:
-                        co_b_i = max(
-                            range(len(fit_result.peaks)),
-                            key=lambda i: fit_result.peaks[i].center
+                        guess = PeakGuess(
+                            center=p.center,
+                            amplitude=amplitude,
+                            sigma=p.sigma,
+                            index=i,
+                            shape=getattr(p, 'shape', shape),
                         )
-                        co_b_area = abs(float(
-                            _trapezoid(fit_result.individual_curves[co_b_i], wn_b)
-                        ))
-                        results['CO_B'] = _make_co_result(
-                            fit_result.peaks[co_b_i].center,
-                            co_b_area
-                        )
+                        guess.assignment = assignments[i] if i < len(assignments) else 'Unassigned'
+                        fitted_guesses.append(guess)
 
-                        fitted_guesses = [
-                            PeakGuess(
-                                center=p.center,
-                                amplitude=float(np.max(fit_result.individual_curves[i]))
-                                if i < len(fit_result.individual_curves) else p.amplitude,
-                                sigma=p.sigma,
-                                index=i,
-                                shape=getattr(p, 'shape', shape),
-                            )
-                            for i, p in enumerate(fit_result.peaks)
-                        ]
-                        co_b_sub['guesses'] = fitted_guesses
-                        co_b_sub['locks'] = locks
-                        co_b_sub['raw_fit_result'] = fit_result
-                        co_b_sub['wn_b'] = wn_b
-                        co_b_sub['ab_pos_b'] = ab_pos_b
-                        co_b_sub['baseline_b'] = bl_b
-                        needs_review = True
+                    manual['guesses'] = fitted_guesses
+                    manual['locks'] = locks
+                    manual['assignments'] = [
+                        self._co_peak_assignment(g) for g in fitted_guesses
+                    ]
+                    manual['fit_result'] = fit_result
+                    manual['wn'] = wn_b
+                    manual['ab'] = ab_pos_b
+                    manual['baseline'] = bl_b
+                    manual['analysis_mode'] = 'manual_fit'
+                    results = self._assigned_co_results_from_fit(
+                        fit_result,
+                        manual['assignments'],
+                        wn_b,
+                    )
+                    needs_review = any(
+                        results[label] is None for label in CO_ASSIGNMENT_TARGETS
+                    )
 
-                        if refresh_plot:
-                            self.plot_widget.show_fit_result(wn_b, ab_pos_b, fit_result,
-                                                             baseline=self._co_display_baseline(bl_b, full_baseline))
-                            self.right_panel.set_co_guesses(fitted_guesses, locks=locks)
-                    else:
-                        results['CO_B'] = None
-                        co_b_sub.pop('raw_fit_result', None)
-                        needs_review = True
+                    if refresh_plot:
+                        self.plot_widget.show_fit_result(wn_b, ab_pos_b, fit_result,
+                                                         baseline=None)
+                        self.right_panel.set_co_guesses(fitted_guesses, locks=locks)
                 else:
-                    results['CO_B'] = None
-                    co_b_sub.pop('raw_fit_result', None)
-                    needs_review = True
+                    manual.pop('fit_result', None)
+                    manual.pop('raw_fit_result', None)
             else:
-                peak_idx_b = int(np.argmax(ab_pos_b))
-                center_b = self._manual_co_center(co_state, 'CO_B', ep0_b, ep1_b)
-                if center_b is None:
-                    center_b = float(wn_b[peak_idx_b])
-                results['CO_B'] = _make_co_result(
-                    center_b,
-                    abs(float(_trapezoid(ab_pos_b, wn_b)))
-                )
-                co_b_sub.pop('guesses', None)
-                co_b_sub.pop('raw_fit_result', None)
-        else:
-            results['CO_B'] = None
-            needs_review = True
+                manual.pop('fit_result', None)
+                manual.pop('raw_fit_result', None)
 
-        for sub in ('CO_L', 'CO_B'):
-            ep0, ep1 = eps[sub]
+        for sub in CO_ASSIGNMENT_TARGETS:
             sub_state = co_state.setdefault(sub, {})
-            sub_state['ep0'] = ep0
-            sub_state['ep1'] = ep1
+            sub_state['ep0'], sub_state['ep1'] = self._co_display_region_for_entry(entry)
             sub_state['fit_result'] = results.get(sub)
             sub_state['status'] = 'review' if needs_review else 'ok'
-            sub_state['analysis_mode'] = 'deconv' if used_deconv and sub == 'CO_B' else 'simple'
+            sub_state['analysis_mode'] = 'manual_fit'
 
         co_l = results.get('CO_L')
         co_b = results.get('CO_B')
@@ -4005,7 +4592,7 @@ class MainWindow(QMainWindow):
         return {
             'co_l': co_l,
             'co_b': co_b,
-            'used_deconv': used_deconv,
+            'used_deconv': bool(guesses),
             'needs_review': needs_review,
         }
 
@@ -4086,7 +4673,7 @@ class MainWindow(QMainWindow):
         self.right_panel.update_co_stark_results(results)
         self.analysis_widget.update_co_stark_results(results)
 
-    # ── CO_B Auto Detect ──────────────────────────────────────
+    # ── CO Auto Guess ─────────────────────────────────────────
 
     def _auto_detect_co_b(self):
         if self._current_entry is None:
@@ -4094,122 +4681,88 @@ class MainWindow(QMainWindow):
             return
 
         entry = self._current_entry
-        wn_full = entry.wavenumber
-        ab_full = entry.absorbance
-
-        eps = self.plot_widget.get_co_endpoints()
-        if not eps or 'CO_B' not in eps:
-            QMessageBox.warning(self, "CO_B", "CO 모드에서 실행하세요.")
-            return
-
-        ep0_b, ep1_b = sorted(eps['CO_B'])
-        cfg = self.right_panel.get_config()
-        full_baseline = None
-        if not self._co_uses_endpoint_linear_baseline(cfg.get('baseline_algo')):
-            full_baseline = self._compute_co_full_baseline(
-                entry,
-                algo=cfg['baseline_algo'],
-                params=cfg['baseline_params'],
-            )
-        wn_b, _, bl_b, ab_pos_b = self._co_subregion_data(
-            entry, ep0_b, ep1_b, full_baseline=full_baseline)
+        wn_b, _, bl_b, ab_pos_b = self._co_b_fit_data(entry)
         if len(wn_b) < 5:
             return
 
-        co_state = self._co_states.setdefault(entry.filepath, {})
-        co_b_sub = co_state.setdefault('CO_B', {})
-        guesses = co_b_sub.get('guesses')
-        if guesses and any(not (ep0_b <= g.center <= ep1_b) for g in guesses):
-            guesses = None
+        manual = self._ensure_co_manual_state(entry)
+        guesses = manual.get('guesses')
         if not guesses:
             guesses = find_peaks_second_derivative(wn_b, ab_pos_b, n_peaks=2)
         if not guesses:
-            self.status_label.setText("CO_B: 피크를 자동 감지할 수 없습니다.")
+            self.status_label.setText("CO: 피크를 자동 감지할 수 없습니다.")
             return
+        for guess in guesses:
+            if not hasattr(guess, 'assignment'):
+                guess.assignment = 'Unassigned'
 
-        co_b_sub['guesses'] = guesses
-        co_b_sub['locks'] = [
+        manual['guesses'] = guesses
+        manual['assignments'] = [self._co_peak_assignment(g) for g in guesses]
+        manual['locks'] = [
             {'center': False, 'amplitude': False, 'sigma': False}
             for _ in guesses
         ]
-        co_b_sub.pop('manual_center_locks', None)
-        co_b_sub.pop('raw_fit_result', None)
-        co_b_sub['wn_b'] = wn_b
-        co_b_sub['ab_pos_b'] = ab_pos_b
-        co_b_sub['baseline_b'] = bl_b
+        manual.pop('manual_center_locks', None)
+        manual.pop('fit_result', None)
+        manual.pop('raw_fit_result', None)
+        manual['wn'] = wn_b
+        manual['ab'] = ab_pos_b
+        manual['baseline'] = bl_b
         self._co_drag_targets = {
-            i: {'type': 'co_b_guess', 'sub': 'CO_B', 'peak_idx': i}
+            i: {'type': 'co_peak_guess', 'peak_idx': i}
             for i in range(len(guesses))
         }
-        self.right_panel.set_co_guesses(guesses, locks=co_b_sub['locks'])
+        self.right_panel.set_co_guesses(guesses, locks=manual['locks'])
         self.plot_widget.show_peak_guesses(
             wn_b,
             guesses,
-            baseline=self._co_display_baseline(bl_b, full_baseline),
+            baseline=None,
         )
         self.status_label.setText(
-            f"CO_B: {len(guesses)}개 피크 감지  —  드래그로 위치 조정 후 Reanalyze Current")
+            f"CO: {len(guesses)}개 피크 감지  —  Assign 지정 후 Fit Current")
 
     def _restore_co_b_fit_viz(self, entry: SpectrumEntry, co_state: dict):
-        """스펙트럼 전환 / 모드 전환 시 CO_B 피팅 시각화 복원"""
-        co_b_sub = co_state.get('CO_B', {})
-        raw_fit = co_b_sub.get('raw_fit_result')
+        """스펙트럼 전환 / 모드 전환 시 CO 피팅 시각화 복원"""
+        manual = self._ensure_co_manual_state(entry)
+        raw_fit = manual.get('fit_result')
         if raw_fit is None or not raw_fit.success:
             return
-        ep0_b = co_state.get('CO_B', {}).get('ep0', 1650.0)
-        ep1_b = co_state.get('CO_B', {}).get('ep1', 1900.0)
-        ep0_b, ep1_b = sorted((ep0_b, ep1_b))
-        cfg = self.right_panel.get_config()
-        full_baseline = None
-        if not self._co_uses_endpoint_linear_baseline(cfg.get('baseline_algo')):
-            full_baseline = self._compute_co_full_baseline(
-                entry,
-                algo=cfg['baseline_algo'],
-                params=cfg['baseline_params'],
-            )
 
         fit_len = 0
         if getattr(raw_fit, 'individual_curves', None):
             fit_len = len(raw_fit.individual_curves[0])
 
-        stored_wn = co_b_sub.get('wn_b')
-        stored_ab_pos = co_b_sub.get('ab_pos_b')
-        stored_bl = co_b_sub.get('baseline_b')
+        stored_wn = manual.get('wn')
+        stored_ab_pos = manual.get('ab')
         if fit_len and stored_wn is not None and len(stored_wn) == fit_len:
             wn_b = np.asarray(stored_wn, dtype=float)
             if stored_ab_pos is not None and len(stored_ab_pos) == fit_len:
                 ab_pos_b = np.asarray(stored_ab_pos, dtype=float)
             else:
                 ab_pos_b = np.zeros_like(wn_b)
-            if full_baseline is None and stored_bl is not None and len(stored_bl) == fit_len:
-                bl_b = np.asarray(stored_bl, dtype=float)
-            else:
-                _, _, bl_b, _ = self._co_subregion_data(
-                    entry, ep0_b, ep1_b, full_baseline=full_baseline)
             self.plot_widget.show_fit_result(
                 wn_b,
                 ab_pos_b,
                 raw_fit,
-                baseline=self._co_display_baseline(bl_b, full_baseline),
+                baseline=None,
             )
             self._co_drag_targets = {
-                i: {'type': 'co_b_fit', 'sub': 'CO_B', 'peak_idx': i}
+                i: {'type': 'co_peak_fit', 'peak_idx': i}
                 for i in range(len(raw_fit.peaks))
             }
             return
 
-        wn_b, _, bl_b, ab_pos_b = self._co_subregion_data(
-            entry, ep0_b, ep1_b, full_baseline=full_baseline)
+        wn_b, _, _, ab_pos_b = self._co_b_fit_data(entry)
         if len(wn_b) < 5:
             return
         self.plot_widget.show_fit_result(
             wn_b,
             ab_pos_b,
             raw_fit,
-            baseline=self._co_display_baseline(bl_b, full_baseline),
+            baseline=None,
         )
         self._co_drag_targets = {
-            i: {'type': 'co_b_fit', 'sub': 'CO_B', 'peak_idx': i}
+            i: {'type': 'co_peak_fit', 'peak_idx': i}
             for i in range(len(raw_fit.peaks))
         }
 
@@ -4221,28 +4774,17 @@ class MainWindow(QMainWindow):
             return
 
         entry = self._current_entry
-        wn_full = entry.wavenumber
-        ab_full = entry.absorbance
-
-        # endpoint 라인이 없으면 초기화
-        if 'SiO_0' not in self.plot_widget._ep_lines:
-            sio_state = self._sio_states.get(entry.filepath, {})
-            eps = (sio_state.get('ep0', 1100.0), sio_state.get('ep1', 1300.0))
-            self.plot_widget.show_sio_baseline(wn_full, ab_full, eps)
-
-        ep0, ep1 = sorted(self.plot_widget.get_sio_endpoints())
-        wn, ab = crop_region(wn_full, ab_full, ep0, ep1)
+        cfg = self.right_panel.get_config()
+        if self.plot_widget.get_sio_endpoints() != (1100.0, 1300.0) or self.plot_widget._ep_lines:
+            ep0, ep1 = sorted(float(v) for v in self.plot_widget.get_sio_endpoints())
+        else:
+            ep0, ep1 = sorted((float(cfg['wn_min']), float(cfg['wn_max'])))
+        wn, _, _, corrected, source = self._analysis_arrays_for_entry(entry, ep0, ep1)
         if len(wn) < 3:
             QMessageBox.warning(self, "Si-O", "선택 영역이 너무 좁습니다.")
             return
 
-        # 선형 베이스라인
-        y0 = float(np.interp(ep0, wn_full, ab_full))
-        y1 = float(np.interp(ep1, wn_full, ab_full))
-        bl = np.interp(wn, [ep0, ep1], [y0, y1])
-        ab_cor = ab - bl
-
-        area = abs(float(_trapezoid(ab_cor, wn)))
+        area = abs(float(_trapezoid(corrected, wn)))
 
         # 현재 세션 전체에 동일한 Si-O reference area를 적용
         target_session = self.spectrum_list.get_session_key_for_entry(entry)
@@ -4254,13 +4796,17 @@ class MainWindow(QMainWindow):
                 session_state['ep0'] = ep0
                 session_state['ep1'] = ep1
             else:
-                session_state.setdefault('ep0', 1100.0)
-                session_state.setdefault('ep1', 1300.0)
+                session_state.setdefault('ep0', ep0)
+                session_state.setdefault('ep1', ep1)
             session_state['area'] = area
+            session_state['region'] = (ep0, ep1)
+            session_state['source'] = source
             self._sio_states[session_entry.filepath] = session_state
         self._sio_ref_area = area
 
         self.right_panel.update_sio_area(area)
+        self.plot_widget.show_analysis_region([(ep0, ep1)])
+        self.plot_widget.update_sio_endpoints(ep0, ep1)
 
         # 현재 스펙트럼의 OH total area / Si-O 정규화 업데이트
         oh_state = self._spectrum_states.get(entry.filepath)
@@ -4274,21 +4820,9 @@ class MainWindow(QMainWindow):
                 self._visible_fit_records(), self._visible_sio_areas(), self._visible_potentials())
 
         self.status_label.setText(
-            f"Si-O Area: {area:.4f}  |  {ep0:.0f}–{ep1:.0f} cm⁻¹")
+            f"Si-O Area: {area:.4f}  |  {ep0:.0f}–{ep1:.0f} cm⁻¹  |  source={source}")
 
     # ── Endpoint 드래그 핸들러 ────────────────────────────────
-
-    def _on_co_endpoint_moved(self, sub: str, side: int, wn: float):
-        if self._current_entry is None:
-            return
-        co_state = self._co_states.setdefault(self._current_entry.filepath, {})
-        sub_state = co_state.setdefault(sub, {'ep0': 2000.0, 'ep1': 2100.0,
-                                               'fit_result': None})
-        if side == 0:
-            sub_state['ep0'] = wn
-        else:
-            sub_state['ep1'] = wn
-        sub_state['manual_override'] = True
 
     def _on_sio_endpoint_moved(self, side: int, wn: float):
         if self._current_entry is None:
@@ -4298,6 +4832,12 @@ class MainWindow(QMainWindow):
             sio_state['ep0'] = wn
         else:
             sio_state['ep1'] = wn
+        ep0, ep1 = sorted(float(v) for v in self.plot_widget.get_sio_endpoints())
+        sio_state['ep0'] = ep0
+        sio_state['ep1'] = ep1
+        sio_state['region'] = (ep0, ep1)
+        self.right_panel.set_region_values(ep0, ep1)
+        self.plot_widget.show_analysis_region([(ep0, ep1)])
 
     def closeEvent(self, event):
         if self._analysis_window is not None:
