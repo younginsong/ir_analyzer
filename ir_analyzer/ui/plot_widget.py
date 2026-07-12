@@ -15,7 +15,7 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QCheckBox, QLabel, QMenu)
 from PyQt5.QtCore import pyqtSignal, Qt, QEvent
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QFont
 from core.fitter import build_model
 from lmfit import Parameters
 
@@ -32,6 +32,9 @@ COLORS = {
 pg.setConfigOptions(antialias=True, background='#1e1e2e', foreground='#cdd6f4')
 
 MIN_SIGMA = 1.0   # 피크 최소 sigma (cm⁻¹)
+AXIS_TEXT_COLOR = '#ffffff'
+AXIS_TICK_FONT_SIZE = 18
+AXIS_LABEL_FONT_SIZE_PX = 21
 
 
 class PeakLine(pg.InfiniteLine):
@@ -165,16 +168,9 @@ class PlotWidget(QWidget):
         layout.addLayout(toolbar)
 
         self.pw = pg.PlotWidget()
-        self.pw.setLabel('bottom', 'Wavenumber (cm⁻¹)',
-                         **{'color': '#6c7086', 'font-size': '12px'})
-        self.pw.setLabel('left', 'Absorbance',
-                         **{'color': '#6c7086', 'font-size': '12px'})
+        self._style_spectrum_axes()
         self.pw.showGrid(x=True, y=True, alpha=0.15)
         self.pw.getPlotItem().invertX(True)
-        self.pw.getAxis('bottom').setTextPen(pg.mkPen('#6c7086'))
-        self.pw.getAxis('left').setTextPen(pg.mkPen('#6c7086'))
-        self.pw.getAxis('bottom').setPen(pg.mkPen('#313244'))
-        self.pw.getAxis('left').setPen(pg.mkPen('#313244'))
         self.pw.getPlotItem().setMenuEnabled(False)
         layout.addWidget(self.pw)
 
@@ -206,6 +202,22 @@ class PlotWidget(QWidget):
         self.cb_residual.toggled.connect(lambda v: self._set_visible('residual', v))
         self.btn_add_peak.toggled.connect(self._on_peak_add_mode)
         self.pw.scene().sigMouseClicked.connect(self._on_mouse_click)
+
+    def _style_spectrum_axes(self):
+        tick_font = QFont()
+        tick_font.setPointSize(AXIS_TICK_FONT_SIZE)
+        for axis_name in ('bottom', 'left'):
+            axis = self.pw.getAxis(axis_name)
+            axis.setTickFont(tick_font)
+            axis.setPen(pg.mkPen('#313244'))
+            axis.setTextPen(pg.mkPen(AXIS_TEXT_COLOR))
+
+        label_style = {
+            'color': AXIS_TEXT_COLOR,
+            'font-size': f'{AXIS_LABEL_FONT_SIZE_PX}px',
+        }
+        self.pw.setLabel('bottom', 'Wavenumber (cm⁻¹)', **label_style)
+        self.pw.setLabel('left', 'Absorbance', **label_style)
 
     # ── 데이터 설정 ───────────────────────────────────────────
 

@@ -1573,7 +1573,6 @@ class MainWindow(QMainWindow):
         self._wn_crop         = None
         self._ab_crop         = None
         self._baseline_points = []
-        self._total_baseline_states = {}
         self.plot_widget._clear_all()
         self.right_panel.clear_current_summary()
         self.right_panel.set_snapshot_names([], selected_index=-1)
@@ -2317,6 +2316,16 @@ class MainWindow(QMainWindow):
         if self._current_entry is None or self._wn_crop is None:
             return
         existing = self._spectrum_states.get(self._current_entry.filepath, {})
+        is_oh_mode = self.right_panel.get_mode() == 'OH'
+        guesses = (
+            self.right_panel.get_guesses()
+            if is_oh_mode else existing.get('guesses', [])
+        )
+        locks = (
+            self.right_panel.get_locks()
+            if is_oh_mode else existing.get('locks', [])
+        )
+        fit_result = self._fit_result if is_oh_mode else existing.get('fit_result')
         manual_override = (
             existing.get('baseline_manual_override', False)
             if baseline_manual_override is None
@@ -2330,9 +2339,9 @@ class MainWindow(QMainWindow):
                               else np.zeros_like(self._wn_crop),
             'ab_corrected':   self._ab_corrected.copy() if self._ab_corrected is not None
                               else np.zeros_like(self._wn_crop),
-            'fit_result':     existing.get('fit_result', self._fit_result),
-            'guesses':        existing.get('guesses', []),
-            'locks':          self.right_panel.get_locks(),
+            'fit_result':     fit_result,
+            'guesses':        guesses,
+            'locks':          locks,
             'baseline_points': list(self._baseline_points),
             'baseline_manual_override': manual_override,
             'snapshots':      existing.get('snapshots', []),
@@ -2423,11 +2432,42 @@ class MainWindow(QMainWindow):
         ab = np.maximum(self._ab_corrected, 0)
         n  = self.right_panel.get_n_peaks()
         guesses = find_peaks_second_derivative(self._wn_crop, ab, n_peaks=n)
+        locks = [
+            {'center': False, 'amplitude': False, 'sigma': False}
+            for _ in guesses
+        ]
         self.right_panel.set_guesses(
             guesses,
-            locks=[{'center': False, 'amplitude': False, 'sigma': False} for _ in guesses]
+            locks=locks,
         )
+        self._fit_result = None
+        self._fit_edit_pending = False
+        self.right_panel.clear_results()
         self.plot_widget.show_peak_guesses(self._wn_crop, guesses)
+        self._spectrum_states[self._current_entry.filepath] = {
+            'wn_crop':        self._wn_crop.copy(),
+            'ab_crop':        self._ab_crop.copy() if self._ab_crop is not None
+                              else self._wn_crop.copy(),
+            'baseline':       self._baseline.copy() if self._baseline is not None
+                              else np.zeros_like(self._wn_crop),
+            'ab_corrected':   self._ab_corrected.copy() if self._ab_corrected is not None
+                              else np.zeros_like(self._wn_crop),
+            'fit_result':     None,
+            'guesses':        guesses,
+            'locks':          locks,
+            'baseline_points': list(self._baseline_points),
+            'baseline_manual_override': self._spectrum_states.get(
+                self._current_entry.filepath, {}
+            ).get('baseline_manual_override', False),
+            'snapshots':      self._get_oh_snapshots(self._current_entry.filepath),
+        }
+        entry_name = self._current_entry.name
+        self._fit_records = [
+            r for r in self._fit_records
+            if r['filename'] != entry_name
+        ]
+        list_idx = self.spectrum_list.list_widget.currentRow()
+        self.spectrum_list.clear_fit_done(list_idx)
         self.status_label.setText(f"Auto-detected {len(guesses)} peaks")
 
     # ── 피크 마우스 클릭 생성 ─────────────────────────────────
@@ -3435,8 +3475,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Auto Fit", "마지막 스펙트럼을 먼저 피팅하세요.")
             return
 
-        first_fit = first_state['fit_result']
-        last_fit  = last_state['fit_result']
+        first_fit = first_state.get('fit_result')
+        last_fit  = last_state.get('fit_result')
+
+        if first_fit is None or not getattr(first_fit, 'peaks', None):
+            QMessageBox.warning(self, "Auto Fit", "첫 번째 스펙트럼을 먼저 피팅하세요.")
+            return
+        if last_fit is None or not getattr(last_fit, 'peaks', None):
+            QMessageBox.warning(self, "Auto Fit", "마지막 스펙트럼을 먼저 피팅하세요.")
+            return
 
         if len(first_fit.peaks) != len(last_fit.peaks):
             QMessageBox.warning(self, "Auto Fit",

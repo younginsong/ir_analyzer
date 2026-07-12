@@ -11,13 +11,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ir_analyzer"))
 
-from PyQt5.QtWidgets import QApplication, QComboBox
+from PyQt5.QtWidgets import QApplication, QComboBox, QMessageBox
 from openpyxl import load_workbook
 
 from core.exporter import export_spectra_excel
 from core.peak_finder import PeakGuess
 from ui.main_window import MainWindow
 from ui.analysis_widget import AnalysisWidget
+from ui.plot_widget import (
+    AXIS_LABEL_FONT_SIZE_PX,
+    AXIS_TEXT_COLOR,
+    AXIS_TICK_FONT_SIZE,
+    PlotWidget,
+)
 from ui.right_panel import RightPanel
 from ui.spectrum_list import SpectrumEntry, SpectrumListWidget
 
@@ -46,6 +52,24 @@ class SpectrumListUiTests(unittest.TestCase):
             widget.findChild(object, "analysis_focus_card"),
             "Focused Spectrum card should not be rendered in Analysis",
         )
+
+    def test_spectrum_plot_axes_use_larger_white_fonts(self):
+        widget = PlotWidget()
+        try:
+            for axis_name in ("bottom", "left"):
+                axis = widget.pw.getAxis(axis_name)
+                tick_font = axis.style["tickFont"]
+                self.assertEqual(tick_font.pointSize(), AXIS_TICK_FONT_SIZE)
+                self.assertFalse(tick_font.bold())
+                self.assertEqual(
+                    axis.labelStyle.get("font-size"),
+                    f"{AXIS_LABEL_FONT_SIZE_PX}px",
+                )
+                self.assertNotIn("font-weight", axis.labelStyle)
+                self.assertEqual(axis.labelStyle.get("color"), AXIS_TEXT_COLOR)
+                self.assertEqual(axis.textPen().color().name(), AXIS_TEXT_COLOR)
+        finally:
+            widget.close()
 
     def test_analysis_compare_tab_exposes_peak_area_metrics(self):
         widget = AnalysisWidget()
@@ -809,6 +833,172 @@ class SpectrumListUiTests(unittest.TestCase):
             self.assertAlmostEqual(points[0][0], float(wn[nearest]))
             self.assertAlmostEqual(points[0][1], float(raw[nearest]))
         finally:
+            window.close()
+
+    def test_total_baseline_survives_adding_new_workspace_and_dpt(self):
+        window = MainWindow()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                first_path = Path(tmpdir) / "first.dpt"
+                second_path = Path(tmpdir) / "second.dpt"
+                first_path.write_text(
+                    "4000 0.010\n3600 0.030\n3200 0.012\n",
+                    encoding="utf-8",
+                )
+                second_path.write_text(
+                    "4000 0.020\n3600 0.040\n3200 0.018\n",
+                    encoding="utf-8",
+                )
+
+                first = window.spectrum_list.add_file(str(first_path))
+                self.assertIsNotNone(first)
+                window.right_panel.set_mode("Total")
+                window._current_entry = first
+                window._on_baseline_point_added(4000.0, 0.010)
+                window._on_baseline_point_added(3200.0, 0.012)
+
+                saved = window._total_baseline_states[first.filepath]
+                self.assertEqual(saved["algo"], "Manual")
+                self.assertEqual(saved["points"], [(4000.0, 0.010), (3200.0, 0.012)])
+
+                window.spectrum_list.create_workspace()
+                second = window.spectrum_list.add_file(str(second_path))
+
+                self.assertIsNotNone(second)
+                self.assertIn(first.filepath, window._total_baseline_states)
+                self.assertEqual(
+                    window._total_baseline_states[first.filepath]["points"],
+                    [(4000.0, 0.010), (3200.0, 0.012)],
+                )
+        finally:
+            window.close()
+
+    def test_auto_detect_updates_existing_oh_state_guesses(self):
+        window = MainWindow()
+        try:
+            wn = np.linspace(3000.0, 4000.0, 401)
+            raw = (
+                0.015 * np.exp(-((wn - 3500.0) / 60.0) ** 2)
+                + 0.007 * np.exp(-((wn - 3650.0) / 45.0) ** 2)
+            )
+            entry = SpectrumEntry(
+                "/tmp/auto-detect-state.dpt",
+                "auto-detect-state.dpt",
+                wn,
+                raw,
+                "#89b4fa",
+            )
+            stale_guess = PeakGuess(center=3100.0, amplitude=0.001, sigma=30.0, index=0)
+            window._current_entry = entry
+            window.right_panel.set_mode("OH")
+            window.right_panel.set_wavenumber_range(3000.0, 4000.0)
+            window.right_panel.spin_n_peaks.setValue(2)
+            window._spectrum_states[entry.filepath] = {
+                "wn_crop": wn.copy(),
+                "ab_crop": raw.copy(),
+                "baseline": np.zeros_like(raw),
+                "ab_corrected": raw.copy(),
+                "fit_result": None,
+                "guesses": [stale_guess],
+                "locks": [],
+                "baseline_points": [],
+                "snapshots": [],
+            }
+
+            window._auto_detect()
+
+            table_centers = [round(g.center, 3) for g in window.right_panel.get_guesses()]
+            stored_centers = [
+                round(g.center, 3)
+                for g in window._spectrum_states[entry.filepath]["guesses"]
+            ]
+            self.assertEqual(stored_centers, table_centers)
+            self.assertNotEqual(stored_centers, [3100.0])
+            self.assertEqual(len(stored_centers), 2)
+        finally:
+            window.close()
+
+    def test_save_current_spectrum_state_uses_current_peak_table(self):
+        window = MainWindow()
+        try:
+            wn = np.linspace(3000.0, 4000.0, 101)
+            raw = np.exp(-((wn - 3500.0) / 70.0) ** 2)
+            entry = SpectrumEntry(
+                "/tmp/save-current-guesses.dpt",
+                "save-current-guesses.dpt",
+                wn,
+                raw,
+                "#89b4fa",
+            )
+            current_guess = PeakGuess(center=3500.0, amplitude=1.0, sigma=70.0, index=0)
+            stale_guess = PeakGuess(center=3100.0, amplitude=0.1, sigma=30.0, index=0)
+            window._current_entry = entry
+            window._wn_crop = wn.copy()
+            window._ab_crop = raw.copy()
+            window._baseline = np.zeros_like(raw)
+            window._ab_corrected = raw.copy()
+            window._baseline_points = []
+            window.right_panel.set_guesses([current_guess], locks=[
+                {"center": False, "amplitude": False, "sigma": False}
+            ])
+            window._spectrum_states[entry.filepath] = {
+                "wn_crop": wn.copy(),
+                "ab_crop": raw.copy(),
+                "baseline": np.zeros_like(raw),
+                "ab_corrected": raw.copy(),
+                "fit_result": None,
+                "guesses": [stale_guess],
+                "locks": [],
+                "baseline_points": [],
+                "snapshots": [],
+            }
+
+            window._save_current_spectrum_state()
+
+            stored = window._spectrum_states[entry.filepath]
+            self.assertEqual(len(stored["guesses"]), 1)
+            self.assertAlmostEqual(stored["guesses"][0].center, 3500.0)
+        finally:
+            window.close()
+
+    def test_auto_fit_requires_endpoint_fit_results(self):
+        window = MainWindow()
+        warnings = []
+        original_warning = QMessageBox.warning
+        try:
+            wn = np.linspace(3000.0, 4000.0, 101)
+            raw = np.exp(-((wn - 3500.0) / 70.0) ** 2)
+            entries = [
+                SpectrumEntry(f"/tmp/auto-fit-{i}.dpt", f"auto-fit-{i}.dpt", wn, raw, "#89b4fa")
+                for i in range(3)
+            ]
+            for entry in entries:
+                window.spectrum_list.add_entry(entry, select=False, emit_signal=False)
+                window._spectrum_states[entry.filepath] = {
+                    "wn_crop": wn.copy(),
+                    "ab_crop": raw.copy(),
+                    "baseline": np.zeros_like(raw),
+                    "ab_corrected": raw.copy(),
+                    "fit_result": None,
+                    "guesses": [PeakGuess(center=3500.0, amplitude=1.0, sigma=70.0, index=0)],
+                    "locks": [],
+                    "baseline_points": [],
+                    "snapshots": [],
+                }
+
+            def fake_warning(parent, title, text, *args, **kwargs):
+                warnings.append((title, text))
+                return QMessageBox.Ok
+
+            QMessageBox.warning = fake_warning
+
+            window._auto_fit()
+
+            self.assertTrue(warnings)
+            self.assertEqual(warnings[-1][0], "Auto Fit")
+            self.assertIn("첫 번째", warnings[-1][1])
+        finally:
+            QMessageBox.warning = original_warning
             window.close()
 
     def test_total_baseline_view_is_rebuilt_after_switching_spectra(self):
