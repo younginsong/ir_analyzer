@@ -600,6 +600,42 @@ class SpectrumListUiTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_export_total_baseline_state_uses_full_wavenumber_range(self):
+        window = MainWindow()
+        try:
+            wn = np.array([1000.0, 1300.0, 1400.0, 1450.0, 1800.0])
+            raw = np.full_like(wn, 5.0)
+            entry = SpectrumEntry(
+                "/tmp/full-range-total-baseline.dpt",
+                "full-range-total-baseline.dpt",
+                wn,
+                raw,
+                "#89b4fa",
+            )
+            window.spectrum_list.add_entry(entry, select=False, emit_signal=False)
+            window._total_baseline_states[entry.filepath] = {
+                "wn": np.array([1300.0, 1400.0, 1450.0]),
+                "raw": np.full(3, 5.0),
+                "baseline": np.full(3, 2.0),
+                "corrected": np.full(3, 3.0),
+                "points": [(1300.0, 2.0), (1450.0, 2.0)],
+                "algo": "Manual",
+                "params": {},
+                "region": (1300.0, 1450.0),
+                "manual_override": True,
+            }
+
+            states = window._visible_export_spectrum_states(prefer_total=True)
+            state = states[entry.filepath]
+
+            np.testing.assert_allclose(state["wn_crop"], wn)
+            np.testing.assert_allclose(state["ab_crop"], raw)
+            np.testing.assert_allclose(state["baseline"], 2.0)
+            np.testing.assert_allclose(state["ab_corrected"], 3.0)
+            self.assertTrue(state["baseline_manual_override"])
+        finally:
+            window.close()
+
     def test_total_integral_uses_corrected_data_and_updates_analysis(self):
         window = MainWindow()
         try:
@@ -1245,6 +1281,54 @@ class SpectrumListUiTests(unittest.TestCase):
         self.assertEqual(raw_row[source_col], "Raw")
         self.assertAlmostEqual(raw_row[baseline_col], 0.0)
         self.assertAlmostEqual(raw_row[input_col], 2.0)
+
+    def test_spectrum_export_writes_corrected_matrix_next_to_raw_matrix(self):
+        wn = np.array([1000.0, 1300.0, 1450.0, 1800.0])
+        first = SpectrumEntry(
+            "/tmp/export-matrix-a.dpt",
+            "export-matrix-a.dpt",
+            wn,
+            np.array([1.0, 2.0, 3.0, 4.0]),
+            "#89b4fa",
+        )
+        second = SpectrumEntry(
+            "/tmp/export-matrix-b.dpt",
+            "export-matrix-b.dpt",
+            wn,
+            np.array([5.0, 6.0, 7.0, 8.0]),
+            "#fab387",
+        )
+        states = {
+            first.filepath: {
+                "wn_crop": wn.copy(),
+                "ab_corrected": np.array([0.1, 0.2, 0.3, 0.4]),
+            },
+            second.filepath: {
+                "wn_crop": wn.copy(),
+                "ab_corrected": np.array([0.5, 0.6, 0.7, 0.8]),
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "spectra.xlsx")
+            info = export_spectra_excel(
+                [first, second], {}, path, spectrum_states=states)
+            workbook = load_workbook(path, data_only=True)
+            sheet = workbook["Corrected Matrix"]
+            headers = [cell.value for cell in sheet[1]]
+            rows = list(sheet.iter_rows(min_row=2, values_only=True))
+
+        self.assertEqual(workbook.sheetnames[1], "Raw Matrix")
+        self.assertEqual(workbook.sheetnames[2], "Corrected Matrix")
+        self.assertEqual(info["corrected_matrix_points"], len(wn))
+        self.assertEqual(headers, [
+            "Wavenumber (cm⁻¹)",
+            first.name,
+            second.name,
+        ])
+        self.assertEqual([row[0] for row in rows], list(wn))
+        self.assertEqual([row[1] for row in rows], [0.1, 0.2, 0.3, 0.4])
+        self.assertEqual([row[2] for row in rows], [0.5, 0.6, 0.7, 0.8])
 
     def test_spectrum_export_includes_integrated_areas_sheet(self):
         wn = np.array([1300.0, 1400.0, 1450.0])

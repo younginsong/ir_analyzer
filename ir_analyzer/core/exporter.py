@@ -97,7 +97,7 @@ def _append_oh_processed_sheet(wb, entries, potentials: dict, spectrum_states: d
                 entry.name,
                 round(potential, 4) if potential is not None else "",
                 round(float(wn[idx]), 4),
-                round(float(ab_raw[idx]), 6),
+                round(float(ab_raw[idx]), 6) if idx < len(ab_raw) else "",
                 round(float(baseline[idx]), 6) if idx < len(baseline) else "",
                 round(float(corrected[idx]), 6) if idx < len(corrected) else "",
                 entry.source_spectrum_path or entry.filepath,
@@ -240,6 +240,66 @@ def _append_integrated_areas_sheet(wb, integrated_records: list | None) -> int:
     return rows_written
 
 
+def _state_values_on_grid(state: dict, base_wn: np.ndarray, value_key: str):
+    state_wn = np.asarray(state.get('wn_crop', []), dtype=float)
+    values = np.asarray(state.get(value_key, []), dtype=float)
+    n = min(len(state_wn), len(values))
+    if n == 0:
+        return None
+    state_wn = state_wn[:n]
+    values = values[:n]
+    if len(state_wn) == len(base_wn) and np.allclose(state_wn, base_wn, atol=1e-6, rtol=0):
+        return values
+
+    order = np.argsort(state_wn)
+    x = state_wn[order]
+    y = values[order]
+    unique_x, unique_indices = np.unique(x, return_index=True)
+    if len(unique_x) < 2:
+        return None
+    unique_y = y[unique_indices]
+    return np.interp(base_wn, unique_x, unique_y, left=np.nan, right=np.nan)
+
+
+def _append_processed_matrix_sheet(wb, title: str, entries,
+                                   spectrum_states: dict,
+                                   base_wn: np.ndarray,
+                                   value_key: str) -> int:
+    if not spectrum_states:
+        return 0
+
+    columns = []
+    for entry in entries:
+        state = spectrum_states.get(entry.filepath)
+        if not state:
+            columns.append(None)
+            continue
+        columns.append(_state_values_on_grid(state, base_wn, value_key))
+
+    if not any(col is not None for col in columns):
+        return 0
+
+    ws = wb.create_sheet(title)
+    headers = ["Wavenumber (cm⁻¹)"] + [entry.name for entry in entries]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+    ws.freeze_panes = "A2"
+
+    rows_written = 0
+    for idx, wn in enumerate(base_wn):
+        row = [round(float(wn), 4)]
+        for values in columns:
+            if values is None or idx >= len(values) or not np.isfinite(values[idx]):
+                row.append("")
+            else:
+                row.append(round(float(values[idx]), 6))
+        ws.append(row)
+        rows_written += 1
+
+    _autosize_columns(ws, sample_row_limit=12, min_width=14)
+    return rows_written
+
+
 def export_spectra_excel(entries, potentials: dict, filepath: str,
                          spectrum_states: dict | None = None,
                          co_states: dict | None = None,
@@ -249,7 +309,8 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
 
     - Index 시트: 스펙트럼 메타데이터
     - Raw Matrix / Raw Spectra: 원본 스펙트럼
-    - OH Processed: OH baseline / corrected
+    - Corrected Matrix: Total baseline-corrected spectra, same grid as Raw Matrix
+    - OH Processed: OH baseline / corrected in long format
     - CO Processed: CO 분석에 사용되는 Total corrected 또는 raw 입력
     """
     if not entries:
@@ -294,6 +355,7 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
                     PatternFill("solid", fgColor=ALT_ROW_COLOR)
 
     layout = "matrix" if _shares_wavenumber_grid(entries) else "long"
+    corrected_matrix_points = 0
 
     if layout == "matrix":
         ws_raw = wb.create_sheet("Raw Matrix")
@@ -310,6 +372,14 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
             ws_raw.append(row)
 
         _autosize_columns(ws_raw, sample_row_limit=12, min_width=14)
+        corrected_matrix_points = _append_processed_matrix_sheet(
+            wb,
+            "Corrected Matrix",
+            entries,
+            spectrum_states or {},
+            base_wn,
+            'ab_corrected',
+        )
     else:
         ws_raw = wb.create_sheet("Raw Spectra")
         headers = [
@@ -351,6 +421,7 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
         'oh_points': oh_points,
         'co_points': co_points,
         'integral_rows': integral_rows,
+        'corrected_matrix_points': corrected_matrix_points,
     }
 
 

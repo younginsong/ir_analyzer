@@ -2288,6 +2288,76 @@ class MainWindow(QMainWindow):
             'region': (float(cfg['wn_min']), float(cfg['wn_max'])),
         }
 
+    def _interpolated_total_baseline_for_export(self, wn: np.ndarray,
+                                                raw: np.ndarray,
+                                                state: dict) -> np.ndarray:
+        state_wn = np.asarray(state.get('wn', []), dtype=float)
+        state_baseline = np.asarray(state.get('baseline', []), dtype=float)
+        n = min(len(state_wn), len(state_baseline))
+        if n < 2:
+            return np.zeros_like(raw)
+
+        x = state_wn[:n]
+        y = state_baseline[:n]
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+        unique_x, unique_indices = np.unique(x, return_index=True)
+        if len(unique_x) < 2:
+            return np.zeros_like(raw)
+        unique_y = y[unique_indices]
+        return np.interp(wn, unique_x, unique_y,
+                         left=unique_y[0], right=unique_y[-1])
+
+    def _total_baseline_export_state(self, entry: SpectrumEntry,
+                                     state: dict) -> dict:
+        wn = np.asarray(entry.wavenumber, dtype=float)
+        raw = np.asarray(entry.absorbance, dtype=float)
+        n = min(len(wn), len(raw))
+        wn = wn[:n]
+        raw = raw[:n]
+        algo = state.get('algo') or 'Manual'
+        params = copy.deepcopy(state.get('params', {}))
+        if not isinstance(params, dict):
+            params = {}
+        points = list(state.get('points', []))
+
+        if n == 0:
+            baseline = np.zeros_like(raw)
+        else:
+            try:
+                if algo == 'Manual':
+                    baseline = (
+                        baseline_from_points(wn, raw, points)
+                        if len(points) >= 2
+                        else self._interpolated_total_baseline_for_export(wn, raw, state)
+                    )
+                elif algo == 'Rubber Band':
+                    baseline = baseline_rubberband(wn, raw)
+                elif algo == 'ARPLS':
+                    baseline = baseline_arpls(raw, lam=params.get('lam', 1e4))
+                elif algo == 'SNIP':
+                    baseline = baseline_snip(raw, n_iter=params.get('n_iter', 50))
+                elif algo == 'Linear':
+                    baseline = baseline_linear(wn, raw)
+                else:
+                    baseline = self._interpolated_total_baseline_for_export(wn, raw, state)
+            except Exception:
+                baseline = self._interpolated_total_baseline_for_export(wn, raw, state)
+
+        return {
+            'wn_crop': wn.copy(),
+            'ab_crop': raw.copy(),
+            'baseline': baseline.copy(),
+            'ab_corrected': subtract_baseline(raw, baseline),
+            'fit_result': None,
+            'guesses': [],
+            'locks': [],
+            'baseline_points': points,
+            'baseline_manual_override': bool(state.get('manual_override', False)),
+            'snapshots': copy.deepcopy(state.get('snapshots', [])),
+        }
+
     def _update_total_baseline_for_entries(self, entries: list[SpectrumEntry],
                                            algo: str | None = None,
                                            params: dict | None = None,
@@ -3424,22 +3494,13 @@ class MainWindow(QMainWindow):
         if not prefer_total:
             return states
 
-        visible_paths = {entry.filepath for entry in self.spectrum_list.get_visible_entries()}
+        visible_entries = self.spectrum_list.get_visible_entries()
+        entry_by_path = {entry.filepath: entry for entry in visible_entries}
         for filepath, state in self._total_baseline_states.items():
-            if filepath not in visible_paths:
+            entry = entry_by_path.get(filepath)
+            if entry is None:
                 continue
-            states[filepath] = {
-                'wn_crop': np.asarray(state.get('wn', []), dtype=float),
-                'ab_crop': np.asarray(state.get('raw', []), dtype=float),
-                'baseline': np.asarray(state.get('baseline', []), dtype=float),
-                'ab_corrected': np.asarray(state.get('corrected', []), dtype=float),
-                'fit_result': None,
-                'guesses': [],
-                'locks': [],
-                'baseline_points': list(state.get('points', [])),
-                'baseline_manual_override': bool(state.get('manual_override', False)),
-                'snapshots': [],
-            }
+            states[filepath] = self._total_baseline_export_state(entry, state)
         return states
 
     def _visible_co_states(self) -> dict:
@@ -3509,9 +3570,14 @@ class MainWindow(QMainWindow):
                     f" / Integrals {export_info.get('integral_rows', 0)} rows"
                     if export_info.get('integral_rows', 0) else ""
                 )
+                corrected_matrix_text = (
+                    f" / Corrected matrix {export_info.get('corrected_matrix_points', 0)} pts"
+                    if export_info.get('corrected_matrix_points', 0) else ""
+                )
                 saved_files.append(
                     f"{export_info['n_spectra']}개 스펙트럼"
                     f" / OH {export_info.get('oh_points', 0)} pts"
+                    f"{corrected_matrix_text}"
                     f"{integral_text}: {Path(fp).name}"
                 )
             elif fitted_count > 1:
@@ -3592,6 +3658,10 @@ class MainWindow(QMainWindow):
             processed_parts = []
             if export_info.get('oh_points', 0) > 0:
                 processed_parts.append(f"OH {export_info['oh_points']} pts")
+            if export_info.get('corrected_matrix_points', 0) > 0:
+                processed_parts.append(
+                    f"Corrected matrix {export_info['corrected_matrix_points']} pts"
+                )
             if export_info.get('co_points', 0) > 0:
                 processed_parts.append(f"CO {export_info['co_points']} pts")
             if export_info.get('integral_rows', 0) > 0:
