@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ir_analyzer"))
 
-from PyQt5.QtWidgets import QApplication, QComboBox, QMessageBox
+from PyQt5.QtWidgets import QApplication, QComboBox, QMessageBox, QTableWidget
 from openpyxl import load_workbook
 
 from core.exporter import export_spectra_excel
@@ -81,6 +81,33 @@ class SpectrumListUiTests(unittest.TestCase):
             [combo.itemData(i) for i in range(combo.count())],
             ["P1", "P2", "P3", "P4", "P1+P2", "P3+P4"],
         )
+
+    def test_analysis_exposes_integrated_area_tab_and_table(self):
+        widget = AnalysisWidget()
+        try:
+            table = widget.findChild(QTableWidget, "analysis_integrated_area_table")
+
+            self.assertIsNotNone(table)
+            widget.set_current_subtab("Integrated Areas")
+            self.assertEqual(widget.get_current_subtab(), "Integrated Areas")
+
+            widget.update_integrated_areas([
+                {
+                    "region_name": "NO3",
+                    "filename": "sample.dpt",
+                    "potential": -0.1,
+                    "area": 1.23,
+                    "wn_min": 1300.0,
+                    "wn_max": 1450.0,
+                    "source": "corrected",
+                }
+            ])
+
+            self.assertEqual(table.rowCount(), 1)
+            self.assertEqual(table.item(0, 0).text(), "NO3")
+            self.assertEqual(table.item(0, 6).text(), "corrected")
+        finally:
+            widget.close()
 
     def test_workspace_save_payload_reopens_as_separate_session_tabs(self):
         source = MainWindow()
@@ -570,6 +597,126 @@ class SpectrumListUiTests(unittest.TestCase):
             self.assertEqual(source, "raw")
             np.testing.assert_allclose(baseline, 0.0)
             np.testing.assert_allclose(out_corrected, out_raw)
+        finally:
+            window.close()
+
+    def test_total_integral_uses_corrected_data_and_updates_analysis(self):
+        window = MainWindow()
+        try:
+            wn = np.array([1200.0, 1300.0, 1400.0, 1450.0, 1500.0])
+            raw_one = np.full_like(wn, 5.0)
+            raw_two = np.full_like(wn, 4.0)
+            corrected_one = np.full_like(wn, 2.0)
+            corrected_two = np.full_like(wn, 1.0)
+            entry_one = SpectrumEntry(
+                "/tmp/integral-one.dpt", "integral-one.dpt", wn, raw_one, "#89b4fa")
+            entry_two = SpectrumEntry(
+                "/tmp/integral-two.dpt", "integral-two.dpt", wn, raw_two, "#fab387")
+            window.spectrum_list.add_entry(entry_one, select=False, emit_signal=False)
+            window.spectrum_list.add_entry(entry_two, select=False, emit_signal=False)
+            window._current_entry = entry_one
+            window.spectrum_list.set_potentials(
+                [entry_one.name, entry_two.name],
+                {entry_one.name: -0.1, entry_two.name: -0.2},
+                emit_changed=False,
+            )
+            window._total_baseline_states = {
+                entry_one.filepath: {
+                    "wn": wn.copy(),
+                    "raw": raw_one.copy(),
+                    "baseline": raw_one - corrected_one,
+                    "corrected": corrected_one.copy(),
+                    "points": [],
+                    "algo": "Manual",
+                    "params": {},
+                    "region": (1200.0, 1500.0),
+                    "manual_override": True,
+                },
+                entry_two.filepath: {
+                    "wn": wn.copy(),
+                    "raw": raw_two.copy(),
+                    "baseline": raw_two - corrected_two,
+                    "corrected": corrected_two.copy(),
+                    "points": [],
+                    "algo": "Manual",
+                    "params": {},
+                    "region": (1200.0, 1500.0),
+                    "manual_override": True,
+                },
+            }
+            window.right_panel.set_mode("Total")
+            window.right_panel.set_total_integral_config({
+                "name": "NO3",
+                "wn_min": 1300.0,
+                "wn_max": 1450.0,
+            })
+
+            window._calculate_total_integral()
+
+            session_key = window.spectrum_list.get_current_session_filter()
+            rows = window._total_integral_results[session_key]["NO3"]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({row["source"] for row in rows}, {"corrected"})
+            areas = {row["filename"]: row["area"] for row in rows}
+            self.assertAlmostEqual(areas[entry_one.name], 300.0)
+            self.assertAlmostEqual(areas[entry_two.name], 150.0)
+            self.assertEqual(window.analysis_widget.integral_table.rowCount(), 2)
+            self.assertEqual(window.analysis_widget.get_current_subtab(), "Integrated Areas")
+        finally:
+            window.close()
+
+    def test_total_integral_falls_back_to_raw_without_total_baseline(self):
+        window = MainWindow()
+        try:
+            wn = np.array([1200.0, 1300.0, 1400.0, 1450.0, 1500.0])
+            raw = np.full_like(wn, 3.0)
+            entry = SpectrumEntry(
+                "/tmp/integral-raw.dpt", "integral-raw.dpt", wn, raw, "#89b4fa")
+            window.spectrum_list.add_entry(entry, select=False, emit_signal=False)
+            window._current_entry = entry
+            window.right_panel.set_mode("Total")
+            window.right_panel.set_total_integral_config({
+                "name": "NO3",
+                "wn_min": 1300.0,
+                "wn_max": 1450.0,
+            })
+
+            window._calculate_total_integral()
+
+            session_key = window.spectrum_list.get_current_session_filter()
+            row = window._total_integral_results[session_key]["NO3"][0]
+            self.assertEqual(row["source"], "raw")
+            self.assertAlmostEqual(row["area"], 450.0)
+        finally:
+            window.close()
+
+    def test_total_integral_state_is_included_in_session_payload(self):
+        window = MainWindow()
+        try:
+            wn = np.array([1200.0, 1300.0, 1400.0, 1450.0, 1500.0])
+            raw = np.full_like(wn, 3.0)
+            entry = SpectrumEntry(
+                "/tmp/integral-payload.dpt", "integral-payload.dpt", wn, raw, "#89b4fa")
+            window.spectrum_list.add_entry(entry, select=False, emit_signal=False)
+            window._current_entry = entry
+            window.right_panel.set_mode("Total")
+            window.right_panel.set_total_integral_config({
+                "name": "NO3",
+                "wn_min": 1300.0,
+                "wn_max": 1450.0,
+            })
+            window._calculate_total_integral()
+
+            payload = window._build_session_payload([entry])
+            session_key = window.spectrum_list.get_current_session_filter()
+
+            self.assertIn(session_key, payload["total_integral_regions"])
+            self.assertIn("NO3", payload["total_integral_regions"][session_key])
+            self.assertIn(session_key, payload["total_integral_results"])
+            self.assertEqual(
+                payload["total_integral_results"][session_key]["NO3"][0]["filename"],
+                entry.name,
+            )
         finally:
             window.close()
 
@@ -1098,6 +1245,55 @@ class SpectrumListUiTests(unittest.TestCase):
         self.assertEqual(raw_row[source_col], "Raw")
         self.assertAlmostEqual(raw_row[baseline_col], 0.0)
         self.assertAlmostEqual(raw_row[input_col], 2.0)
+
+    def test_spectrum_export_includes_integrated_areas_sheet(self):
+        wn = np.array([1300.0, 1400.0, 1450.0])
+        raw = np.ones_like(wn)
+        entry = SpectrumEntry(
+            "/tmp/export-integral.dpt", "export-integral.dpt", wn, raw, "#89b4fa")
+        integrated_records = [
+            {
+                "session_label": "Sample A",
+                "region_name": "NO3",
+                "filename": entry.name,
+                "potential": -0.1,
+                "wn_min": 1300.0,
+                "wn_max": 1450.0,
+                "area": 0.123456789,
+                "source": "corrected",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "spectra.xlsx")
+            info = export_spectra_excel(
+                [entry],
+                {entry.name: -0.1},
+                path,
+                integrated_records=integrated_records,
+            )
+            workbook = load_workbook(path, data_only=True)
+            sheet = workbook["Integrated Areas"]
+            headers = [cell.value for cell in sheet[1]]
+            row = [cell.value for cell in sheet[2]]
+
+        self.assertEqual(info["integral_rows"], 1)
+        self.assertEqual(headers, [
+            "Session",
+            "Region",
+            "Spectrum",
+            "Potential (V)",
+            "Region Min (cm⁻¹)",
+            "Region Max (cm⁻¹)",
+            "Area",
+            "Input Source",
+        ])
+        self.assertEqual(row[0], "Sample A")
+        self.assertEqual(row[1], "NO3")
+        self.assertEqual(row[2], entry.name)
+        self.assertAlmostEqual(row[3], -0.1)
+        self.assertAlmostEqual(row[6], 0.12345679)
+        self.assertEqual(row[7], "corrected")
 
     def test_sio_area_uses_total_corrected_with_user_region(self):
         window = MainWindow()

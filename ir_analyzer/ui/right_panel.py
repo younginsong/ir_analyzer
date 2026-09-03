@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QPushButton, QDoubleSpinBox, QSpinBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QLabel, QCheckBox, QStackedWidget, QScrollArea
+    QLabel, QCheckBox, QStackedWidget, QScrollArea, QLineEdit
 )
 from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
@@ -66,6 +66,7 @@ class RightPanel(QWidget):
     total_probe_toggled   = pyqtSignal(bool)
     total_reset_shifts    = pyqtSignal()
     oh_overlay_intensity_changed = pyqtSignal()
+    total_integral_requested = pyqtSignal()
     snapshot_save_requested = pyqtSignal()
     snapshot_restore_requested = pyqtSignal(int)
     snapshot_delete_requested = pyqtSignal(int)
@@ -539,6 +540,45 @@ class RightPanel(QWidget):
         intensity_grp.setLayout(intensity_layout)
         layout.addWidget(intensity_grp)
         self._on_oh_overlay_intensity_changed()
+
+        integral_grp = QGroupBox("Integrated Area")
+        integral_layout = QVBoxLayout()
+        integral_layout.setContentsMargins(6, 6, 6, 6)
+        integral_layout.setSpacing(6)
+
+        integral_form = QFormLayout()
+        integral_form.setSpacing(6)
+        self.edit_total_integral_name = QLineEdit("NO3")
+        self.edit_total_integral_name.setObjectName("total_integral_name")
+        integral_form.addRow("Name:", self.edit_total_integral_name)
+
+        self.spin_total_integral_min = QDoubleSpinBox()
+        self.spin_total_integral_min.setRange(0, 10000)
+        self.spin_total_integral_min.setDecimals(2)
+        self.spin_total_integral_min.setValue(1300.0)
+        self.spin_total_integral_min.setSuffix("  cm⁻¹")
+        integral_form.addRow("Min:", self.spin_total_integral_min)
+
+        self.spin_total_integral_max = QDoubleSpinBox()
+        self.spin_total_integral_max.setRange(0, 10000)
+        self.spin_total_integral_max.setDecimals(2)
+        self.spin_total_integral_max.setValue(1450.0)
+        self.spin_total_integral_max.setSuffix("  cm⁻¹")
+        integral_form.addRow("Max:", self.spin_total_integral_max)
+
+        integral_layout.addLayout(integral_form)
+        self.total_integral_preview_label = QLabel("Current Area:  —")
+        self.total_integral_preview_label.setObjectName("result_value")
+        self.total_integral_preview_label.setWordWrap(True)
+        integral_layout.addWidget(self.total_integral_preview_label)
+
+        btn_integral = QPushButton("▶  Calculate Area")
+        btn_integral.setObjectName("btn_success")
+        btn_integral.clicked.connect(self.total_integral_requested.emit)
+        integral_layout.addWidget(btn_integral)
+
+        integral_grp.setLayout(integral_layout)
+        layout.addWidget(integral_grp)
 
         tip = QLabel("색상은 Potential 값 기준이며, 값이 없으면 목록 색상을 사용합니다.")
         tip.setStyleSheet("color: #6c7086; font-size: 11px;")
@@ -1063,6 +1103,39 @@ class RightPanel(QWidget):
             'wn_min': min(wn_min, wn_max),
             'wn_max': max(wn_min, wn_max),
         }
+
+    def get_total_integral_config(self) -> dict:
+        name = self.edit_total_integral_name.text().strip() or "Region"
+        wn_min = float(self.spin_total_integral_min.value())
+        wn_max = float(self.spin_total_integral_max.value())
+        return {
+            'name': name,
+            'wn_min': min(wn_min, wn_max),
+            'wn_max': max(wn_min, wn_max),
+        }
+
+    def set_total_integral_config(self, config: dict):
+        widgets = [
+            self.edit_total_integral_name,
+            self.spin_total_integral_min,
+            self.spin_total_integral_max,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.edit_total_integral_name.setText(str(config.get('name') or "Region"))
+        self.spin_total_integral_min.setValue(float(config.get('wn_min', 1300.0)))
+        self.spin_total_integral_max.setValue(float(config.get('wn_max', 1450.0)))
+        for widget in widgets:
+            widget.blockSignals(False)
+
+    def update_total_integral_preview(self, area, source: str | None = None):
+        if area is None:
+            self.total_integral_preview_label.setText("Current Area:  —")
+            return
+        suffix = f"  |  {source}" if source else ""
+        self.total_integral_preview_label.setText(
+            f"Current Area:  {float(area):.6f}{suffix}"
+        )
 
     def get_n_peaks(self) -> int:
         return self.spin_n_peaks.value()

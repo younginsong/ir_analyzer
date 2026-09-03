@@ -191,9 +191,59 @@ def _append_co_processed_sheet(wb, entries, potentials: dict,
     return rows_written
 
 
+def _append_integrated_areas_sheet(wb, integrated_records: list | None) -> int:
+    """사용자 지정 Total 적분 결과를 저장."""
+    if not integrated_records:
+        return 0
+
+    ws = wb.create_sheet("Integrated Areas")
+    headers = [
+        "Session",
+        "Region",
+        "Spectrum",
+        "Potential (V)",
+        "Region Min (cm⁻¹)",
+        "Region Max (cm⁻¹)",
+        "Area",
+        "Input Source",
+    ]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+    ws.freeze_panes = "A2"
+
+    def _sort_key(record):
+        potential = record.get('potential')
+        potential_key = float(potential) if potential is not None else float('inf')
+        return (
+            str(record.get('session_label') or ''),
+            str(record.get('region_name') or ''),
+            potential_key,
+            str(record.get('filename') or ''),
+        )
+
+    rows_written = 0
+    for record in sorted(integrated_records, key=_sort_key):
+        potential = record.get('potential')
+        ws.append([
+            record.get('session_label', ''),
+            record.get('region_name', ''),
+            record.get('filename', ''),
+            round(float(potential), 4) if potential is not None else "",
+            round(float(record.get('wn_min', 0.0)), 4),
+            round(float(record.get('wn_max', 0.0)), 4),
+            round(float(record.get('area', 0.0)), 8),
+            record.get('source', ''),
+        ])
+        rows_written += 1
+
+    _autosize_columns(ws, sample_row_limit=20, min_width=14)
+    return rows_written
+
+
 def export_spectra_excel(entries, potentials: dict, filepath: str,
                          spectrum_states: dict | None = None,
-                         co_states: dict | None = None) -> dict:
+                         co_states: dict | None = None,
+                         integrated_records: list | None = None) -> dict:
     """
     로드된 스펙트럼 전체를 별도 Excel 파일로 저장.
 
@@ -289,6 +339,7 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
     oh_points = _append_oh_processed_sheet(wb, entries, potentials, spectrum_states or {})
     co_points = _append_co_processed_sheet(
         wb, entries, potentials, spectrum_states or {})
+    integral_rows = _append_integrated_areas_sheet(wb, integrated_records)
 
     _autosize_columns(ws_idx, sample_row_limit=20, min_width=14)
     wb.save(filepath)
@@ -299,6 +350,7 @@ def export_spectra_excel(entries, potentials: dict, filepath: str,
         'n_points': total_points,
         'oh_points': oh_points,
         'co_points': co_points,
+        'integral_rows': integral_rows,
     }
 
 
@@ -307,7 +359,8 @@ def export_single(wavenumber: np.ndarray,
                   baseline: np.ndarray,
                   fit_result: FitResult,
                   filepath: str,
-                  filename: str = ""):
+                  filename: str = "",
+                  integrated_records: list | None = None):
     """단일 파일 피팅 결과를 Excel로 저장"""
     wb = Workbook()
 
@@ -382,13 +435,16 @@ def export_single(wavenumber: np.ndarray,
         ws_res.append([round(wavenumber[j], 2),
                         round(fit_result.residual[j], 8)])
 
+    _append_integrated_areas_sheet(wb, integrated_records)
+
     wb.save(filepath)
     return filepath
 
 
 def export_all_spectra(entries, spectrum_states: dict, potentials: dict,
                        stark_results: list, filepath: str,
-                       sio_ref_area=None):
+                       sio_ref_area=None,
+                       integrated_records: list | None = None):
     """
     모든 스펙트럼 피팅 결과를 퍼텐셜별 시트로 분리하여 저장.
     마지막 시트(Summary)에는 Area Fraction 요약 + Stark Tuning Slopes 수록.
@@ -552,6 +608,7 @@ def export_all_spectra(entries, spectrum_states: dict, potentials: dict,
 
     # 컬럼 너비
     _autosize_columns(ws_s, min_width=14)
+    _append_integrated_areas_sheet(wb, integrated_records)
 
     wb.save(filepath)
     return filepath

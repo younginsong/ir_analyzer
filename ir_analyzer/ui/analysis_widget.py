@@ -20,7 +20,7 @@ def _connect_points(pw, xs, ys, color, width=1.5):
 
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QLabel, QVBoxLayout, QGridLayout, QTabWidget,
-    QComboBox,
+    QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -92,6 +92,7 @@ class AnalysisWidget(QWidget):
         self._focus_filename = None
         self._focus_items = []
         self._compare_records = []
+        self._integral_records = []
         self._build_ui()
 
     def _build_ui(self):
@@ -157,6 +158,39 @@ class AnalysisWidget(QWidget):
 
         self._tabs.addTab(self._co_widget, "  CO  ")
 
+        # ── Integrated Areas 서브탭 ─────────────────────────────
+        self._integral_widget = QWidget()
+        integral_layout = QVBoxLayout(self._integral_widget)
+        integral_layout.setContentsMargins(6, 6, 6, 6)
+        integral_layout.setSpacing(8)
+
+        self.integral_pw = _make_pw(
+            'Integrated Area vs Potential',
+            'Potential (V)',
+            'Integrated Area',
+        )
+        integral_layout.addWidget(self.integral_pw, 1)
+
+        self.integral_table = QTableWidget(0, 7)
+        self.integral_table.setObjectName("analysis_integrated_area_table")
+        self.integral_table.setHorizontalHeaderLabels([
+            "Region", "Potential (V)", "Spectrum", "Area",
+            "Min", "Max", "Source",
+        ])
+        self.integral_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.integral_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.integral_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.integral_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.integral_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.integral_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.integral_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.integral_table.verticalHeader().setVisible(False)
+        self.integral_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.integral_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        integral_layout.addWidget(self.integral_table, 0)
+
+        self._tabs.addTab(self._integral_widget, "  Integrated Areas  ")
+
         # ── Compare 서브탭 ─────────────────────────────────────
         self._compare_widget = QWidget()
         compare_layout = QVBoxLayout(self._compare_widget)
@@ -215,15 +249,25 @@ class AnalysisWidget(QWidget):
             return 'CO'
         if widget is getattr(self, '_compare_widget', None):
             return 'Compare'
+        if widget is getattr(self, '_integral_widget', None):
+            return 'Integrated Areas'
         index = self._tabs.currentIndex()
         if index == 1:
             return 'CO'
         if index == 2:
+            return 'Integrated Areas'
+        if index == 3:
             return 'Compare'
         return 'OH'
 
     def set_current_subtab(self, subtab: str):
-        index = {'OH': 0, 'CO': 1, 'Compare': 2}.get(subtab, 0)
+        index = {
+            'OH': 0,
+            'CO': 1,
+            'Integrated Areas': 2,
+            'Integrals': 2,
+            'Compare': 3,
+        }.get(subtab, 0)
         self._tabs.setCurrentIndex(index)
 
     def _on_compare_metric_changed(self, _index: int):
@@ -288,6 +332,7 @@ class AnalysisWidget(QWidget):
             return
         self._apply_oh_focus_highlight()
         self._apply_co_focus_highlight()
+        self._apply_integral_focus_highlight()
 
     def _apply_oh_focus_highlight(self):
         potential = self._potentials.get(self._focus_filename)
@@ -355,6 +400,29 @@ class AnalysisWidget(QWidget):
             self._add_focus_marker(self.co_stark_pw, potential, l_peak.center, '#89b4fa')
         if b_peak is not None:
             self._add_focus_marker(self.co_stark_pw, potential, b_peak.center, '#fab387')
+
+    def _apply_integral_focus_highlight(self):
+        potential = self._potentials.get(self._focus_filename)
+        if potential is None or not self._integral_records:
+            return
+
+        focus_records = [
+            record for record in self._integral_records
+            if record.get('filename') == self._focus_filename
+            and record.get('potential') is not None
+        ]
+        if not focus_records:
+            return
+
+        self._add_focus_line(self.integral_pw, potential)
+        for idx, record in enumerate(focus_records):
+            color = PEAK_COLORS[idx % len(PEAK_COLORS)]
+            self._add_focus_marker(
+                self.integral_pw,
+                float(potential),
+                float(record.get('area', 0.0)),
+                color,
+            )
 
     # ── OH 업데이트 ────────────────────────────────────────────
 
@@ -582,6 +650,79 @@ class AnalysisWidget(QWidget):
             )
             if len(xs) >= 2:
                 _connect_points(self.oh_total_pw, xs, ys, '#89b4fa')
+
+    # ── Integrated Areas 업데이트 ─────────────────────────────
+
+    def update_integrated_areas(self, records: list):
+        self._integral_records = list(records or [])
+        if self._integral_records:
+            self._overlay.setVisible(False)
+        self._redraw_integrated_areas()
+
+    def _redraw_integrated_areas(self):
+        self.integral_table.setRowCount(0)
+        _reset_legend(self.integral_pw)
+
+        def _sort_key(record):
+            potential = record.get('potential')
+            potential_key = float(potential) if potential is not None else float('inf')
+            return (
+                str(record.get('region_name') or ''),
+                potential_key,
+                str(record.get('filename') or ''),
+            )
+
+        for record in sorted(self._integral_records, key=_sort_key):
+            row = self.integral_table.rowCount()
+            self.integral_table.insertRow(row)
+            potential = record.get('potential')
+            values = [
+                record.get('region_name', ''),
+                f"{float(potential):.4f}" if potential is not None else "",
+                record.get('filename', ''),
+                f"{float(record.get('area', 0.0)):.6f}",
+                f"{float(record.get('wn_min', 0.0)):.2f}",
+                f"{float(record.get('wn_max', 0.0)):.2f}",
+                record.get('source', ''),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col in (1, 3, 4, 5):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.integral_table.setItem(row, col, item)
+
+        grouped = defaultdict(lambda: {'V': [], 'area': []})
+        for record in self._integral_records:
+            potential = record.get('potential')
+            if potential is None:
+                continue
+            grouped[str(record.get('region_name') or 'Region')]['V'].append(float(potential))
+            grouped[str(record.get('region_name') or 'Region')]['area'].append(
+                float(record.get('area', 0.0))
+            )
+
+        for idx, region_name in enumerate(sorted(grouped.keys())):
+            values = grouped[region_name]
+            xs = np.array(values['V'])
+            ys = np.array(values['area'])
+            order = np.argsort(xs)
+            xs = xs[order]
+            ys = ys[order]
+            color = PEAK_COLORS[idx % len(PEAK_COLORS)]
+            self.integral_pw.plot(
+                xs, ys,
+                pen=None,
+                symbol='o',
+                symbolSize=10,
+                symbolBrush=pg.mkBrush(color),
+                symbolPen=pg.mkPen('#1e1e2e', width=1),
+                name=region_name,
+            )
+            if len(xs) >= 2:
+                self.integral_pw.plot(xs, ys, pen=pg.mkPen(color, width=1.8))
+
+        self.integral_table.resizeRowsToContents()
+        self._apply_focus_highlight()
 
     # ── CO 업데이트 ────────────────────────────────────────────
 

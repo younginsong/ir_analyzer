@@ -176,6 +176,8 @@ class MainWindow(QMainWindow):
         self._total_shifts: dict[str, dict[str, float]] = {}
         self._total_view_mode: str = 'overlay'
         self._total_inactive_ranges: dict[str, list[tuple[float, float]]] = {}
+        self._total_integral_regions: dict[str, dict[str, dict]] = {}
+        self._total_integral_results: dict[str, dict[str, list[dict]]] = {}
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         # Split view 상태
@@ -336,6 +338,7 @@ class MainWindow(QMainWindow):
         self.right_panel.total_probe_toggled.connect(self.plot_widget.set_total_probe_mode)
         self.right_panel.total_reset_shifts.connect(self._reset_total_shifts)
         self.right_panel.oh_overlay_intensity_changed.connect(self._on_oh_overlay_intensity_changed)
+        self.right_panel.total_integral_requested.connect(self._calculate_total_integral)
         self.spectrum_list.potential_assignments_changed.connect(self._on_potential_assignments_changed)
         self.spectrum_list.session_filter_changed.connect(self._on_session_filter_changed)
         self.spectrum_list.workspace_created.connect(self._on_workspace_created)
@@ -507,6 +510,11 @@ class MainWindow(QMainWindow):
         self._sync_analysis_sidebar()
 
         self._refresh_oh_stark_results(potentials)
+        self._recalculate_total_integrals_for_session(
+            self._current_total_integral_session_key(),
+            update_analysis=False,
+        )
+        self._refresh_total_integral_analysis()
 
         co_fit_records = self._visible_co_fit_records()
         if co_fit_records:
@@ -552,6 +560,135 @@ class MainWindow(QMainWindow):
             record for record in self._co_fit_records
             if record.get('filename') in visible_names
         ]
+
+    def _current_total_integral_session_key(self) -> str:
+        return self.spectrum_list.get_current_session_filter()
+
+    def _normalize_total_integral_regions(self, regions) -> dict[str, dict[str, dict]]:
+        if not isinstance(regions, dict):
+            return {}
+        normalized = {}
+        for session_key, session_regions in regions.items():
+            if not isinstance(session_regions, dict):
+                continue
+            for region_name, region in session_regions.items():
+                if not isinstance(region, dict):
+                    continue
+                name = str(region.get('name') or region_name or 'Region').strip() or 'Region'
+                try:
+                    wn_min = float(region.get('wn_min'))
+                    wn_max = float(region.get('wn_max'))
+                except (TypeError, ValueError):
+                    continue
+                lo, hi = sorted((wn_min, wn_max))
+                normalized.setdefault(str(session_key), {})[name] = {
+                    'name': name,
+                    'wn_min': lo,
+                    'wn_max': hi,
+                }
+        return normalized
+
+    def _merge_total_integral_region_set(self, session_key: str, regions: dict):
+        normalized = self._normalize_total_integral_regions({
+            session_key: regions or {},
+        }).get(session_key, {})
+        if not normalized:
+            return
+        target = self._total_integral_regions.setdefault(session_key, {})
+        for name, region in normalized.items():
+            target[name] = region
+
+    def _last_total_integral_region(self, session_key: str | None = None) -> dict | None:
+        key = session_key or self._current_total_integral_session_key()
+        regions = self._total_integral_regions.get(key, {})
+        if not regions:
+            return None
+        return copy.deepcopy(next(reversed(regions.values())))
+
+    def _visible_total_integral_records(self) -> list[dict]:
+        session_key = self._current_total_integral_session_key()
+        visible_paths = {entry.filepath for entry in self._visible_entries()}
+        records = []
+        for rows in self._total_integral_results.get(session_key, {}).values():
+            records.extend(
+                copy.deepcopy(row)
+                for row in rows
+                if row.get('filepath') in visible_paths
+            )
+        return records
+
+    def _update_total_integral_preview(self, records: list[dict],
+                                       region_name: str | None = None):
+        if self._current_entry is None:
+            self.right_panel.update_total_integral_preview(None)
+            return
+        for record in records:
+            if (
+                record.get('filepath') == self._current_entry.filepath
+                and (region_name is None or record.get('region_name') == region_name)
+            ):
+                self.right_panel.update_total_integral_preview(
+                    record.get('area'), record.get('source'))
+                return
+        self.right_panel.update_total_integral_preview(None)
+
+    def _refresh_total_integral_analysis(self, sync_controls: bool = False):
+        region = self._last_total_integral_region()
+        if sync_controls and region is not None:
+            self.right_panel.set_total_integral_config(region)
+        records = self._visible_total_integral_records()
+        self.analysis_widget.update_integrated_areas(records)
+        self._update_total_integral_preview(
+            records,
+            region.get('name') if region else None,
+        )
+
+    def _total_integral_row_for_entry(self, entry: SpectrumEntry,
+                                      region: dict) -> dict | None:
+        wn_min = float(region['wn_min'])
+        wn_max = float(region['wn_max'])
+        wn, _raw, _baseline, corrected, source = self._analysis_arrays_for_entry(
+            entry, wn_min, wn_max)
+        if len(wn) < 2 or len(corrected) < 2:
+            return None
+        n = min(len(wn), len(corrected))
+        area = abs(float(_trapezoid(corrected[:n], wn[:n])))
+        potentials = self.spectrum_list.get_potentials()
+        session_key = self.spectrum_list.get_session_key_for_entry(entry)
+        return {
+            'session_key': session_key,
+            'session_label': self.spectrum_list.get_session_label_for_key(session_key),
+            'region_name': region['name'],
+            'filename': entry.name,
+            'filepath': entry.filepath,
+            'potential': potentials.get(entry.name),
+            'wn_min': min(wn_min, wn_max),
+            'wn_max': max(wn_min, wn_max),
+            'area': area,
+            'source': 'corrected' if source == 'total' else 'raw',
+        }
+
+    def _recalculate_total_integrals_for_session(self, session_key: str,
+                                                 update_analysis: bool = True):
+        regions = self._total_integral_regions.get(session_key, {})
+        if not regions:
+            self._total_integral_results.pop(session_key, None)
+            if update_analysis:
+                self._refresh_total_integral_analysis()
+            return
+
+        entries = self._entries_for_session_key(session_key)
+        session_results = {}
+        for region_name, region in regions.items():
+            rows = []
+            for entry in entries:
+                row = self._total_integral_row_for_entry(entry, region)
+                if row is not None:
+                    rows.append(row)
+            session_results[region_name] = rows
+        self._total_integral_results[session_key] = session_results
+        if update_analysis:
+            self._refresh_total_integral_analysis()
 
     def _all_session_compare_records(self) -> list:
         potentials = self.spectrum_list.get_potentials()
@@ -804,6 +941,30 @@ class MainWindow(QMainWindow):
             f"{action} Total region: {lo:.1f}-{hi:.1f} cm⁻¹"
         )
 
+    def _calculate_total_integral(self):
+        if self.right_panel.get_mode() != 'Total':
+            return
+        session_key = self._current_total_integral_session_key()
+        entries = self._entries_for_session_key(session_key)
+        if not entries:
+            QMessageBox.warning(self, "No spectra", "현재 workspace에 적분할 스펙트럼이 없습니다.")
+            return
+
+        config = self.right_panel.get_total_integral_config()
+        region_name = config['name']
+        self._total_integral_regions.setdefault(session_key, {})[region_name] = config
+        self._recalculate_total_integrals_for_session(session_key, update_analysis=True)
+        self._apply_total_view(preserve_view=True)
+        self._show_analysis_view(preferred_subtab='Integrated Areas')
+
+        rows = self._total_integral_results.get(session_key, {}).get(region_name, [])
+        self._update_total_integral_preview(rows, region_name)
+        self.status_label.setText(
+            f"Integrated {region_name}: "
+            f"{config['wn_min']:.1f}-{config['wn_max']:.1f} cm⁻¹  |  "
+            f"{len(rows)}/{len(entries)} spectra"
+        )
+
     def _build_total_specs(self) -> list[dict]:
         entries = self._selected_total_entries()
         potentials = self._visible_potentials()
@@ -863,6 +1024,12 @@ class MainWindow(QMainWindow):
         self.plot_widget.show_total_spectra(specs, active_name=active_name)
         self.plot_widget.set_total_inactive_ranges(
             self._current_total_inactive_ranges())
+        integral_region = self._last_total_integral_region()
+        if integral_region is not None:
+            self.plot_widget.show_analysis_region(
+                [(integral_region['wn_min'], integral_region['wn_max'])],
+                color='#f9e2af',
+            )
         if self.right_panel.btn_edit_bl.isChecked():
             state = (
                 self._total_baseline_states.get(self._current_entry.filepath, {})
@@ -1196,6 +1363,21 @@ class MainWindow(QMainWindow):
                     self._total_inactive_ranges[mapped_key] = self._merge_total_ranges(
                         merged_ranges)
 
+        imported_integral_regions = self._normalize_total_integral_regions(
+            data.get('total_integral_regions', {}))
+        if imported_integral_regions:
+            if is_workspace_payload:
+                for old_session_key, regions in imported_integral_regions.items():
+                    mapped_label = session_label_map.get(str(old_session_key))
+                    if mapped_label is None:
+                        continue
+                    mapped_key = self._session_key_for_import_label(mapped_label)
+                    self._merge_total_integral_region_set(mapped_key, regions)
+            else:
+                mapped_key = self._session_key_for_import_label(fallback_label)
+                for regions in imported_integral_regions.values():
+                    self._merge_total_integral_region_set(mapped_key, regions)
+
         for old_fp, state in data.get('co_states', {}).items():
             new_fp = old_to_new_fp.get(old_fp)
             if new_fp is not None:
@@ -1493,6 +1675,12 @@ class MainWindow(QMainWindow):
         self._sio_states.pop(filepath, None)
         for shifts in self._total_shifts.values():
             shifts.pop(name, None)
+        for by_region in self._total_integral_results.values():
+            for region_name, rows in list(by_region.items()):
+                by_region[region_name] = [
+                    row for row in rows
+                    if row.get('filepath') != filepath and row.get('filename') != name
+                ]
 
         # 제거된 스펙트럼이 현재 표시 중이면 화면 초기화
         if self._current_entry is not None and self._current_entry.filepath == filepath:
@@ -1551,6 +1739,7 @@ class MainWindow(QMainWindow):
         ):
             self._clear_display()
         self._refresh_analysis_for_visible_session()
+        self._refresh_total_integral_analysis(sync_controls=True)
         if self.right_panel.get_mode() == 'Total':
             self._apply_total_view(preserve_view=False)
             return
@@ -1575,6 +1764,7 @@ class MainWindow(QMainWindow):
         self._baseline_points = []
         self.plot_widget._clear_all()
         self.right_panel.clear_current_summary()
+        self.right_panel.update_total_integral_preview(None)
         self.right_panel.set_snapshot_names([], selected_index=-1)
         self.right_panel.btn_snapshot_save.setEnabled(False)
         self.setWindowTitle("In Situ IR Analyzer")
@@ -1871,6 +2061,7 @@ class MainWindow(QMainWindow):
             self.right_panel.set_guesses([], locks=[])
             self.right_panel.clear_results()
             self._apply_total_view(preserve_view=True)
+            self._refresh_total_integral_analysis()
             self._sync_analysis_sidebar()
             return
 
@@ -2124,6 +2315,16 @@ class MainWindow(QMainWindow):
             )
             self._total_baseline_states[entry.filepath] = state
 
+        affected_session_keys = {
+            self.spectrum_list.get_session_key_for_entry(entry)
+            for entry in entries
+        }
+        for session_key in affected_session_keys:
+            self._recalculate_total_integrals_for_session(
+                session_key,
+                update_analysis=False,
+            )
+        self._refresh_total_integral_analysis()
         self._apply_total_view(preserve_view=True)
 
     def _restore_total_baseline_points_for_current(self):
@@ -3265,6 +3466,7 @@ class MainWindow(QMainWindow):
         co_states = self._visible_co_states()
         fit_records = self._visible_fit_records()
         co_fit_records = self._visible_co_fit_records()
+        integrated_records = self._visible_total_integral_records()
 
         fitted_count = sum(
             1 for s in spectrum_states.values()
@@ -3279,8 +3481,9 @@ class MainWindow(QMainWindow):
             )
         )
         co_count = len(co_fit_records)
+        integral_count = len(integrated_records)
 
-        if fitted_count == 0 and oh_processed_count == 0 and co_count == 0:
+        if fitted_count == 0 and oh_processed_count == 0 and co_count == 0 and integral_count == 0:
             QMessageBox.warning(self, "No result", "현재 세션에 내보낼 결과 또는 스펙트럼 상태가 없습니다.")
             return
 
@@ -3293,17 +3496,23 @@ class MainWindow(QMainWindow):
 
         saved_files = []
         try:
-            if fitted_count == 0 and oh_processed_count > 0:
+            if fitted_count == 0 and (oh_processed_count > 0 or integral_count > 0):
                 export_info = export_spectra_excel(
                     entries,
                     potentials,
                     fp,
                     spectrum_states=export_spectrum_states,
                     co_states=co_states,
+                    integrated_records=integrated_records,
+                )
+                integral_text = (
+                    f" / Integrals {export_info.get('integral_rows', 0)} rows"
+                    if export_info.get('integral_rows', 0) else ""
                 )
                 saved_files.append(
                     f"{export_info['n_spectra']}개 스펙트럼"
-                    f" / OH {export_info.get('oh_points', 0)} pts: {Path(fp).name}"
+                    f" / OH {export_info.get('oh_points', 0)} pts"
+                    f"{integral_text}: {Path(fp).name}"
                 )
             elif fitted_count > 1:
                 stark = calculate_stark_slopes(
@@ -3317,7 +3526,8 @@ class MainWindow(QMainWindow):
                 }
                 export_all_spectra(entries, spectrum_states,
                                    potentials, stark, fp,
-                                   sio_ref_area=sio_areas)
+                                   sio_ref_area=sio_areas,
+                                   integrated_records=integrated_records)
                 saved_files.append(f"{fitted_count}개 OH 스펙트럼: {Path(fp).name}")
             elif fitted_count == 1:
                 fitted_entry = None
@@ -3333,7 +3543,8 @@ class MainWindow(QMainWindow):
                     return
                 export_single(fitted_state['wn_crop'], fitted_state['ab_crop'],
                               fitted_state['baseline'], fitted_state['fit_result'],
-                              fp, fitted_entry.name)
+                              fp, fitted_entry.name,
+                              integrated_records=integrated_records)
                 saved_files.append(f"OH: {Path(fp).name}")
 
             if co_count > 0:
@@ -3375,6 +3586,7 @@ class MainWindow(QMainWindow):
                 fp,
                 spectrum_states=self._visible_export_spectrum_states(prefer_total=True),
                 co_states=self._visible_co_states(),
+                integrated_records=self._visible_total_integral_records(),
             )
             layout_label = "matrix" if export_info['layout'] == 'matrix' else "long-format"
             processed_parts = []
@@ -3382,6 +3594,8 @@ class MainWindow(QMainWindow):
                 processed_parts.append(f"OH {export_info['oh_points']} pts")
             if export_info.get('co_points', 0) > 0:
                 processed_parts.append(f"CO {export_info['co_points']} pts")
+            if export_info.get('integral_rows', 0) > 0:
+                processed_parts.append(f"Integrals {export_info['integral_rows']} rows")
             processed_text = ""
             if processed_parts:
                 processed_text = "\n" + " / ".join(processed_parts)
@@ -3769,6 +3983,8 @@ class MainWindow(QMainWindow):
             self._fit_records      = []
             self._spectrum_states  = {}
             self._total_baseline_states = {}
+            self._total_integral_regions = {}
+            self._total_integral_results = {}
             self._co_states        = {}
             self._sio_states       = {}
             self._co_fit_records   = []
@@ -3790,6 +4006,7 @@ class MainWindow(QMainWindow):
             self.analysis_widget.update_co_plots([], {}, [])
             self.analysis_widget.update_co_stark_results([])
             self.analysis_widget.update_compare_plot([])
+            self.analysis_widget.update_integrated_areas([])
             self.setWindowTitle("In Situ IR Analyzer")
             self._sync_analysis_sidebar()
         finally:
@@ -3856,6 +4073,28 @@ class MainWindow(QMainWindow):
             }
             if filtered:
                 total_shifts[session_key] = filtered
+
+        total_integral_regions = {
+            session_key: copy.deepcopy(regions)
+            for session_key, regions in self._total_integral_regions.items()
+            if session_key in entry_session_keys
+        }
+        total_integral_results = {}
+        for session_key, by_region in self._total_integral_results.items():
+            if session_key not in entry_session_keys or not isinstance(by_region, dict):
+                continue
+            filtered_regions = {}
+            for region_name, rows in by_region.items():
+                filtered_rows = [
+                    copy.deepcopy(row)
+                    for row in rows
+                    if row.get('filename') in entry_names
+                    and row.get('filepath') in entry_paths
+                ]
+                if filtered_rows:
+                    filtered_regions[region_name] = filtered_rows
+            if filtered_regions:
+                total_integral_results[session_key] = filtered_regions
 
         stark_results = (
             calculate_stark_slopes(
@@ -3924,6 +4163,8 @@ class MainWindow(QMainWindow):
                 for session_key, ranges in self._total_inactive_ranges.items()
                 if session_key in entry_session_keys
             },
+            'total_integral_regions': total_integral_regions,
+            'total_integral_results': total_integral_results,
         }
 
     def _save_entries(self, entries: list[SpectrumEntry], title: str,
@@ -3999,6 +4240,8 @@ class MainWindow(QMainWindow):
             removed = self.spectrum_list.remove_session(session_key)
             self._total_shifts.pop(session_key, None)
             self._total_inactive_ranges.pop(session_key, None)
+            self._total_integral_regions.pop(session_key, None)
+            self._total_integral_results.pop(session_key, None)
         finally:
             self._loading_session = False
 
@@ -4037,6 +4280,8 @@ class MainWindow(QMainWindow):
         self.right_panel.clear_stark_results()
         self._spectrum_states  = {}
         self._total_baseline_states = {}
+        self._total_integral_regions = {}
+        self._total_integral_results = {}
         self._fit_records      = []
         self._co_states        = {}
         self._co_fit_records   = []
@@ -4102,6 +4347,15 @@ class MainWindow(QMainWindow):
             for session_key, ranges in data.get('total_inactive_ranges', {}).items()
             if isinstance(ranges, (list, tuple))
         }
+        self._total_integral_regions = self._normalize_total_integral_regions(
+            data.get('total_integral_regions', {}))
+        self._total_integral_results = copy.deepcopy(
+            data.get('total_integral_results', {}))
+        for session_key in self._total_integral_regions:
+            self._recalculate_total_integrals_for_session(
+                session_key,
+                update_analysis=False,
+            )
         self.right_panel.set_total_view_mode(self._total_view_mode)
 
         # Potential 테이블 복원 (저장된 값 그대로)
@@ -4137,6 +4391,7 @@ class MainWindow(QMainWindow):
                     self._visible_fit_records(), self._visible_sio_areas(), self._visible_potentials())
 
         self._refresh_session_compare()
+        self._refresh_total_integral_analysis(sync_controls=True)
         self._loading_session = False
 
         # 세션을 열면 전체 스펙트럼 비교 화면을 먼저 보여준다.
@@ -4165,6 +4420,7 @@ class MainWindow(QMainWindow):
             self.plot_widget.clear_baseline_points()
             self._apply_total_view(preserve_view=False)
             self._sync_baseline_edit_state_for_current_spectrum()
+            self._refresh_total_integral_analysis(sync_controls=True)
             self._refresh_snapshot_panel()
             return
 

@@ -1659,7 +1659,7 @@ class PlotWidget(QWidget):
 
     def show_analysis_region(self, wn_pairs: list, color: str = '#cdd6f4'):
         self.clear_analysis_region()
-        pen = pg.mkPen('#ffffff', width=1.5, style=Qt.SolidLine)
+        pen = pg.mkPen(color, width=1.5, style=Qt.SolidLine)
         for wn_min, wn_max in wn_pairs:
             for pos in (min(wn_min, wn_max), max(wn_min, wn_max)):
                 line = pg.InfiniteLine(pos=pos, angle=90, movable=False, pen=pen)
